@@ -15,6 +15,7 @@ from tf2_msgs.msg import TFMessage
 
 
 CAMERA_INFO_RE = re.compile(r'^/sensing/camera/(camera\d+)/camera_info$')
+CAMERA_LINK_RE = re.compile(r'^(camera\d+)/camera_link$')
 
 
 def rpy_to_quaternion(roll, pitch, yaw):
@@ -63,6 +64,23 @@ def load_tf_message(params_dir: Path, bag_timestamp_ns: int) -> TFMessage:
 
     if not transforms:
         sys.exit('Error: multi_tf_static.yaml parsed to 0 transforms')
+
+    # Auto-generate camera_optical_link for each camera_link.
+    # The optical frame is always at a fixed rotation from camera_link:
+    # RPY(-pi/2, 0, -pi/2) → quaternion(-0.5, 0.5, -0.5, 0.5)
+    optical_transforms = []
+    for ts in transforms:
+        m = CAMERA_LINK_RE.match(ts.child_frame_id)
+        if m:
+            cam_prefix = m.group(1)
+            opt = TransformStamped()
+            opt.header.stamp = stamp
+            opt.header.frame_id = ts.child_frame_id
+            opt.child_frame_id = f'{cam_prefix}/camera_optical_link'
+            opt.transform.translation = Vector3(x=0.0, y=0.0, z=0.0)
+            opt.transform.rotation = Quaternion(x=-0.5, y=0.5, z=-0.5, w=0.5)
+            optical_transforms.append(opt)
+    transforms.extend(optical_transforms)
 
     return TFMessage(transforms=transforms)
 
@@ -149,16 +167,13 @@ def main():
         writer.create_topic(topic)
 
     warned_cameras = set()
-    tf_written = False
 
     while reader.has_next():
         topic, raw, timestamp = reader.read_next()
 
         if topic == '/tf_static':
-            if not tf_written:
-                tf_msg = load_tf_message(params_dir, timestamp)
-                writer.write(topic, serialize_message(tf_msg), timestamp)
-                tf_written = True
+            tf_msg = load_tf_message(params_dir, timestamp)
+            writer.write(topic, serialize_message(tf_msg), timestamp)
             continue
 
         m = CAMERA_INFO_RE.match(topic)

@@ -166,7 +166,7 @@ class TestTfStaticReplacement:
 
         msgs = read_bag_messages(output)
         tf_msgs = [(t, r) for t, r, _ in msgs if t == '/tf_static']
-        assert len(tf_msgs) == 1, 'Expected exactly one /tf_static message in output'
+        assert len(tf_msgs) == 1, 'Input had one /tf_static; output must have one'
 
         tf_msg = deserialize_message(tf_msgs[0][1], TFMessage)
         by_child = {ts.child_frame_id: ts for ts in tf_msg.transforms}
@@ -217,6 +217,154 @@ class TestTfStaticReplacement:
         for ts in tf_msg.transforms:
             assert ts.header.stamp.sec == 1
             assert ts.header.stamp.nanosec == 0
+
+    def test_all_tf_static_messages_converted(self, tmp_path, params_dir):
+        """Every /tf_static message in input must appear (converted) in output."""
+        bag_path = tmp_path / 'multi_tf.mcap'
+        timestamps = [1_000_000_000, 2_000_000_000, 3_000_000_000]
+        write_bag(bag_path, [
+            ('/tf_static', 'tf2_msgs/msg/TFMessage', make_tf_static_raw(), ts)
+            for ts in timestamps
+        ])
+
+        output = tmp_path / 'out.mcap'
+        result = run_replace(bag_path, output, params_dir)
+        assert result.returncode == 0, result.stderr
+
+        out_msgs = read_bag_messages(output)
+        tf_out = [(t, r, bag_ts) for t, r, bag_ts in out_msgs if t == '/tf_static']
+        assert len(tf_out) == len(timestamps), (
+            f'Expected {len(timestamps)} /tf_static messages, got {len(tf_out)}'
+        )
+
+        # Each output message must carry the corresponding bag timestamp as its header stamp
+        for (_, raw, bag_ts), expected_ns in zip(tf_out, timestamps):
+            tf_msg = deserialize_message(raw, TFMessage)
+            expected_sec = expected_ns // 1_000_000_000
+            expected_nanosec = expected_ns % 1_000_000_000
+            for transform in tf_msg.transforms:
+                assert transform.header.stamp.sec == expected_sec
+                assert transform.header.stamp.nanosec == expected_nanosec
+
+        # All converted messages must use params values (not original translation 99,99,99)
+        for _, raw, _ in tf_out:
+            tf_msg = deserialize_message(raw, TFMessage)
+            for transform in tf_msg.transforms:
+                assert abs(transform.transform.translation.x - 99.0) > 1.0
+
+
+# ── Test 1b: camera_optical_link auto-generation ─────────────────────────────
+
+class TestCameraOpticalLinkGeneration:
+    def test_optical_link_generated_for_each_camera_link(self, tmp_path, params_dir, input_bag):
+        """camera_optical_link must be auto-generated for every camera_link frame."""
+        tf_data = {
+            'lidar_front': {
+                'camera0/camera_link': {'x': 1.0, 'y': 0.0, 'z': 0.0,
+                                        'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+                'camera1/camera_link': {'x': 2.0, 'y': 0.0, 'z': 0.0,
+                                        'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+            },
+        }
+        (params_dir / 'multi_tf_static.yaml').write_text(yaml.dump(tf_data))
+
+        output = tmp_path / 'out.mcap'
+        result = run_replace(input_bag, output, params_dir)
+        assert result.returncode == 0, result.stderr
+
+        msgs = read_bag_messages(output)
+        tf_msgs = [(t, r) for t, r, _ in msgs if t == '/tf_static']
+        tf_msg = deserialize_message(tf_msgs[0][1], TFMessage)
+        child_frames = {ts.child_frame_id for ts in tf_msg.transforms}
+
+        assert 'camera0/camera_optical_link' in child_frames
+        assert 'camera1/camera_optical_link' in child_frames
+
+    def test_optical_link_parent_is_camera_link(self, tmp_path, params_dir, input_bag):
+        tf_data = {
+            'lidar_front': {
+                'camera0/camera_link': {'x': 1.0, 'y': 0.0, 'z': 0.0,
+                                        'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+            },
+        }
+        (params_dir / 'multi_tf_static.yaml').write_text(yaml.dump(tf_data))
+
+        output = tmp_path / 'out.mcap'
+        run_replace(input_bag, output, params_dir)
+
+        msgs = read_bag_messages(output)
+        tf_msgs = [(t, r) for t, r, _ in msgs if t == '/tf_static']
+        tf_msg = deserialize_message(tf_msgs[0][1], TFMessage)
+        by_child = {ts.child_frame_id: ts for ts in tf_msg.transforms}
+
+        opt = by_child['camera0/camera_optical_link']
+        assert opt.header.frame_id == 'camera0/camera_link'
+
+    def test_optical_link_rotation_is_standard(self, tmp_path, params_dir, input_bag):
+        """Rotation must be RPY(-pi/2, 0, -pi/2) -> quaternion(-0.5, 0.5, -0.5, 0.5)."""
+        tf_data = {
+            'lidar_front': {
+                'camera0/camera_link': {'x': 1.0, 'y': 0.0, 'z': 0.0,
+                                        'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+            },
+        }
+        (params_dir / 'multi_tf_static.yaml').write_text(yaml.dump(tf_data))
+
+        output = tmp_path / 'out.mcap'
+        run_replace(input_bag, output, params_dir)
+
+        msgs = read_bag_messages(output)
+        tf_msgs = [(t, r) for t, r, _ in msgs if t == '/tf_static']
+        tf_msg = deserialize_message(tf_msgs[0][1], TFMessage)
+        by_child = {ts.child_frame_id: ts for ts in tf_msg.transforms}
+
+        q = by_child['camera0/camera_optical_link'].transform.rotation
+        assert abs(q.x - (-0.5)) < 1e-6
+        assert abs(q.y - 0.5) < 1e-6
+        assert abs(q.z - (-0.5)) < 1e-6
+        assert abs(q.w - 0.5) < 1e-6
+
+    def test_optical_link_translation_is_zero(self, tmp_path, params_dir, input_bag):
+        tf_data = {
+            'lidar_front': {
+                'camera0/camera_link': {'x': 1.0, 'y': 0.0, 'z': 0.0,
+                                        'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+            },
+        }
+        (params_dir / 'multi_tf_static.yaml').write_text(yaml.dump(tf_data))
+
+        output = tmp_path / 'out.mcap'
+        run_replace(input_bag, output, params_dir)
+
+        msgs = read_bag_messages(output)
+        tf_msgs = [(t, r) for t, r, _ in msgs if t == '/tf_static']
+        tf_msg = deserialize_message(tf_msgs[0][1], TFMessage)
+        by_child = {ts.child_frame_id: ts for ts in tf_msg.transforms}
+
+        t = by_child['camera0/camera_optical_link'].transform.translation
+        assert abs(t.x) < 1e-9
+        assert abs(t.y) < 1e-9
+        assert abs(t.z) < 1e-9
+
+    def test_non_camera_link_frames_not_affected(self, tmp_path, params_dir, input_bag):
+        """Non-camera_link frames (e.g. imu_link) must not get an optical_link sibling."""
+        tf_data = {
+            'base_link': {
+                'imu_link': {'x': 0.0, 'y': 0.0, 'z': 0.0,
+                             'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0},
+            },
+        }
+        (params_dir / 'multi_tf_static.yaml').write_text(yaml.dump(tf_data))
+
+        output = tmp_path / 'out.mcap'
+        run_replace(input_bag, output, params_dir)
+
+        msgs = read_bag_messages(output)
+        tf_msgs = [(t, r) for t, r, _ in msgs if t == '/tf_static']
+        tf_msg = deserialize_message(tf_msgs[0][1], TFMessage)
+        child_frames = {ts.child_frame_id for ts in tf_msg.transforms}
+
+        assert not any('optical_link' in f for f in child_frames)
 
 
 # ── Test 2: camera_info K matrix replacement ─────────────────────────────────
