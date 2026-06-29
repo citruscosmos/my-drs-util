@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""lidar_right の点群を camera(2/3) 画像へ投影する。
+"""LiDAR 点群をカメラ画像へ投影する。
 
 2 パターン出力:
-  - undistort/ : 画像を歪み補正(rational_polynomial, balance=1 相当=alpha=1 黒縁あり/全画角保持)
-                 -> ピンホール投影(新カメラ行列 newK)で点を重畳
-  - distort/   : 原画像はそのまま -> 点群側を歪みモデルで投影(cv2.projectPoints)
+  - undistort/ : 画像を歪み補正 -> ピンホール投影(新カメラ行列 newK)で点を重畳
+  - distort/   : 原画像はそのまま -> 点群側を歪みモデルで投影
+
+歪みモデルは --distortion-model で切り替え:
+  rational_polynomial (デフォルト): cv2.projectPoints / cv2.initUndistortRectifyMap
+  equidistant (魚眼):               cv2.fisheye.projectPoints / cv2.fisheye.initUndistortRectifyMap
+
+equidistant を使う場合は D を 4 係数(k1,k2,k3,k4)に更新すること。
 
 点の色は intensity を 0~40 で正規化した JET カラーマップ。半透過(alpha)で重畳。
 内部パラメータは全カメラ共通(ユーザ提供 camera2 の camera_info を使い回し)。
-カメラごとに変わるのは外部パラメータ(lidar_right -> cameraN/camera_link)のみ。
+カメラごとに変わるのは外部パラメータ(lidarX -> cameraN/camera_link)のみ。
 """
 import argparse
 import glob
@@ -20,6 +25,8 @@ import cv2
 import numpy as np
 
 # ---- カメラ内部パラメータ (ユーザ提供 camera_info, 全カメラ共通で使い回し) ----
+# distortion_model: rational_polynomial -> D は 8 係数
+# distortion_model: equidistant         -> D を 4 係数(k1,k2,k3,k4)に書き換えること
 FX, FY = 1495.316895, 1494.778564
 CX, CY = 1424.459106, 943.463684
 K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
@@ -86,7 +93,7 @@ def make_T(t, q):
 
 
 def extrinsic_lr_to_optical(cam_cfg):
-    """lidar_right 座標 -> camera optical 座標 への (R, t) を返す。"""
+    """lidar 座標 -> camera optical 座標 への (R, t) を返す。"""
     M_lr_cl = make_T(cam_cfg["t"], cam_cfg["q"])  # cl -> lr
     M_cl_col = make_T(T2_t, T2_q)                 # col -> cl
     M_lr_col = M_lr_cl @ M_cl_col                 # col -> lr
@@ -94,10 +101,36 @@ def extrinsic_lr_to_optical(cam_cfg):
     return M_col_lr[:3, :3], M_col_lr[:3, 3]
 
 
-# balance=1 相当: alpha=1 で全画角を保持(黒縁あり)。点投影もこの newK を使う。
-NEW_K, _roi = cv2.getOptimalNewCameraMatrix(K, D, (IMG_W, IMG_H), 1, (IMG_W, IMG_H))
-NFX, NFY = NEW_K[0, 0], NEW_K[1, 1]
-NCX, NCY = NEW_K[0, 2], NEW_K[1, 2]
+def build_undistort(distortion_model):
+    """モデルに応じた (new_K, map1, map2, project_fn) を返す。
+
+    project_fn(pts_Nx3) -> uv_Nx2: カメラ座標系の点をピクセル座標へ投影する関数。
+    """
+    if distortion_model == "equidistant":
+        # cv2.fisheye は D を (4,1) で要求する
+        if D.size < 4:
+            raise ValueError("equidistant モデルには D が 4 係数以上必要です")
+        D4 = D[:4].reshape(4, 1)
+        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D4, (IMG_W, IMG_H), np.eye(3), balance=1.0)
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+            K, D4, np.eye(3), new_K, (IMG_W, IMG_H), cv2.CV_16SC2)
+
+        def project_fn(pts):
+            uv, _ = cv2.fisheye.projectPoints(
+                pts.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, D4)
+            return uv.reshape(-1, 2)
+    else:  # rational_polynomial
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (IMG_W, IMG_H), 1, (IMG_W, IMG_H))
+        map1, map2 = cv2.initUndistortRectifyMap(
+            K, D, None, new_K, (IMG_W, IMG_H), cv2.CV_16SC2)
+
+        def project_fn(pts):
+            uv, _ = cv2.projectPoints(
+                pts.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, D)
+            return uv.reshape(-1, 2)
+
+    return new_K, map1, map2, project_fn
 
 
 def read_pcd_xyzi(path):
@@ -141,11 +174,16 @@ def draw_points(img, u, v, colors, rad=2, alpha=0.45):
     return img
 
 
-def run(cam, out_root, sample, limit, alpha, start_ns, end_ns, cam_dir=None, lidar_dir=None):
+def run(cam, out_root, sample, limit, alpha, start_ns, end_ns,
+        cam_dir=None, lidar_dir=None, distortion_model="rational_polynomial"):
     cfg = CAM_CONFIGS[cam]
     R_col_lr, t_col_lr = extrinsic_lr_to_optical(cfg)
     cam_dir = cam_dir or cfg["dir"]
     lidar_dir = lidar_dir or cfg["lidar"]
+
+    new_K, map1, map2, project_fn = build_undistort(distortion_model)
+    nfx, nfy = new_K[0, 0], new_K[1, 1]
+    ncx, ncy = new_K[0, 2], new_K[1, 2]
 
     cam_files = sorted(glob.glob(f"{cam_dir}/*.jpg"))
     cam_ts = np.array([int(os.path.basename(p).split('.')[0]) for p in cam_files])
@@ -172,8 +210,6 @@ def run(cam, out_root, sample, limit, alpha, start_ns, end_ns, cam_dir=None, lid
     out_un.mkdir(parents=True, exist_ok=True)
     out_di.mkdir(parents=True, exist_ok=True)
 
-    map1, map2 = cv2.initUndistortRectifyMap(K, D, None, NEW_K, (IMG_W, IMG_H), cv2.CV_16SC2)
-
     t0 = time.time()
     done = 0
     for li in idxs:
@@ -194,16 +230,14 @@ def run(cam, out_root, sample, limit, alpha, start_ns, end_ns, cam_dir=None, lid
         # --- distort: 原画像 + 歪み込み投影 ---
         img_di = img.copy()
         if p_col.shape[0] > 0:
-            uv, _ = cv2.projectPoints(p_col.reshape(-1, 1, 3),
-                                      np.zeros(3), np.zeros(3), K, D)
-            uv = uv.reshape(-1, 2)
+            uv = project_fn(p_col)
             draw_points(img_di, uv[:, 0], uv[:, 1], colors, alpha=alpha)
 
-        # --- undistort: 歪み補正画像(balance=1, 黒縁あり) + ピンホール投影(newK) ---
+        # --- undistort: 歪み補正画像 + ピンホール投影(newK) ---
         img_un = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
         if p_col.shape[0] > 0:
-            u = NFX * p_col[:, 0] / p_col[:, 2] + NCX
-            v = NFY * p_col[:, 1] / p_col[:, 2] + NCY
+            u = nfx * p_col[:, 0] / p_col[:, 2] + ncx
+            v = nfy * p_col[:, 1] / p_col[:, 2] + ncy
             draw_points(img_un, u, v, colors, alpha=alpha)
 
         name = f"{lts}.jpg"
@@ -231,12 +265,20 @@ def main():
                     help="カメラ画像ディレクトリ(省略時はCAM_CONFIGSのパスを使用)")
     ap.add_argument("--lidar-dir", default=None,
                     help="LiDAR PCDディレクトリ(省略時はCAM_CONFIGSのパスを使用)")
+    ap.add_argument("--distortion-model", default="rational_polynomial",
+                    choices=["rational_polynomial", "equidistant"],
+                    help="カメラ歪みモデル(デフォルト: rational_polynomial)")
     args = ap.parse_args()
     start_ns = int(args.start * 1e9) if args.start is not None else None
     end_ns = int(args.end * 1e9) if args.end is not None else None
-    print(f"cam={args.cam} alpha={args.alpha}\nNEW_K(alpha=1)=\n{NEW_K}", flush=True)
+
+    new_K_preview, _, _, _ = build_undistort(args.distortion_model)
+    print(f"cam={args.cam} alpha={args.alpha} distortion_model={args.distortion_model}\n"
+          f"new_K=\n{new_K_preview}", flush=True)
+
     run(args.cam, args.out_root, args.sample, args.limit, args.alpha, start_ns, end_ns,
-        cam_dir=args.cam_dir, lidar_dir=args.lidar_dir)
+        cam_dir=args.cam_dir, lidar_dir=args.lidar_dir,
+        distortion_model=args.distortion_model)
 
 
 if __name__ == "__main__":

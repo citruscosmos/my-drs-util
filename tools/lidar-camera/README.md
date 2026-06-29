@@ -154,6 +154,7 @@ python3 project_lidar_to_cam.py <cam> <out_root> [--sample <N>] [--limit <N>] [-
 | `--end` | | `None` | End time in Unix seconds |
 | `--cam-dir` | | `CAM_CONFIGS` | Camera image directory (overrides hardcoded path) |
 | `--lidar-dir` | | `CAM_CONFIGS` | LiDAR PCD directory (overrides hardcoded path) |
+| `--distortion-model` | | `rational_polynomial` | Distortion model: `rational_polynomial` or `equidistant` (fisheye) |
 
 **Camera–LiDAR pairs:**
 
@@ -218,4 +219,5 @@ sample.mcap
 
 ## Known Limitations
 
-- Camera intrinsics are shared across all cameras (camera2 values are reused for camera3, 6, and 7).
+- Camera intrinsics (`K`, `D`) are shared across all cameras (camera2 values are reused for camera3, 6, and 7).
+- When using `--distortion-model equidistant`, update `D` in the script to 4 coefficients (k1, k2, k3, k4) for your fisheye camera.
