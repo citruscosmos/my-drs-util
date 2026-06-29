@@ -152,6 +152,8 @@ python3 project_lidar_to_cam.py <cam> <out_root> [--sample <N>] [--limit <N>] [-
 | `--alpha` | | `0.45` | Point opacity (0 = fully transparent, 1 = opaque) |
 | `--start` | | `None` | Start time in Unix seconds (e.g. `1751234567.0`) |
 | `--end` | | `None` | End time in Unix seconds |
+| `--cam-dir` | | `CAM_CONFIGS` | Camera image directory (overrides hardcoded path) |
+| `--lidar-dir` | | `CAM_CONFIGS` | LiDAR PCD directory (overrides hardcoded path) |
 
 **Camera–LiDAR pairs:**
 
@@ -216,5 +218,4 @@ sample.mcap
 
 ## Known Limitations
 
-- Input directory paths in `project_lidar_to_cam.py` are hardcoded in `CAM_CONFIGS`.
 - Camera intrinsics are shared across all cameras (camera2 values are reused for camera3, 6, and 7).

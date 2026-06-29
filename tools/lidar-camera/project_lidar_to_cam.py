@@ -141,14 +141,15 @@ def draw_points(img, u, v, colors, rad=2, alpha=0.45):
     return img
 
 
-def run(cam, out_root, sample, limit, alpha, start_ns, end_ns):
+def run(cam, out_root, sample, limit, alpha, start_ns, end_ns, cam_dir=None, lidar_dir=None):
     cfg = CAM_CONFIGS[cam]
     R_col_lr, t_col_lr = extrinsic_lr_to_optical(cfg)
-    cam_dir = cfg["dir"]
+    cam_dir = cam_dir or cfg["dir"]
+    lidar_dir = lidar_dir or cfg["lidar"]
 
     cam_files = sorted(glob.glob(f"{cam_dir}/*.jpg"))
     cam_ts = np.array([int(os.path.basename(p).split('.')[0]) for p in cam_files])
-    lidar_files = sorted(glob.glob(f"{cfg['lidar']}/*.pcd"))
+    lidar_files = sorted(glob.glob(f"{lidar_dir}/*.pcd"))
     lidar_ts = np.array([int(os.path.basename(p).split('.')[0]) for p in lidar_files])
 
     if start_ns is not None:
@@ -226,11 +227,16 @@ def main():
                     help="点の不透明度(0~1)。小さいほど背景が透ける")
     ap.add_argument("--start", type=float, default=None, help="開始時刻(UNIX秒)")
     ap.add_argument("--end", type=float, default=None, help="終了時刻(UNIX秒)")
+    ap.add_argument("--cam-dir", default=None,
+                    help="カメラ画像ディレクトリ(省略時はCAM_CONFIGSのパスを使用)")
+    ap.add_argument("--lidar-dir", default=None,
+                    help="LiDAR PCDディレクトリ(省略時はCAM_CONFIGSのパスを使用)")
     args = ap.parse_args()
     start_ns = int(args.start * 1e9) if args.start is not None else None
     end_ns = int(args.end * 1e9) if args.end is not None else None
     print(f"cam={args.cam} alpha={args.alpha}\nNEW_K(alpha=1)=\n{NEW_K}", flush=True)
-    run(args.cam, args.out_root, args.sample, args.limit, args.alpha, start_ns, end_ns)
+    run(args.cam, args.out_root, args.sample, args.limit, args.alpha, start_ns, end_ns,
+        cam_dir=args.cam_dir, lidar_dir=args.lidar_dir)
 
 
 if __name__ == "__main__":
