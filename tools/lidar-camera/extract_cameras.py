@@ -3,16 +3,19 @@
 
 ファイル名は header.stamp のナノ秒(エポック)。 {sec}{nanosec:09d}.jpg
 --cams 未指定時は MCAP 内の全カメラトピックを自動検出する。
+各カメラディレクトリに camera_info.json も保存する。
 """
 import argparse
+import json
 import re
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 from mcap.reader import make_reader
 from rclpy.serialization import deserialize_message
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CameraInfo, CompressedImage
 
 _CAM_TOPIC_RE = re.compile(r"^/sensing/camera/(camera\d+)/image_raw/compressed$")
 
@@ -35,6 +38,37 @@ def discover_cam_map(mcap_path):
             if m:
                 cam_map[ch.topic] = m.group(1)
     return cam_map
+
+
+def extract_camera_infos(mcap_path, cam_names, out_root):
+    """各カメラの最初の CameraInfo を {cam_dir}/camera_info.json に保存する。"""
+    info_topics = {
+        f"/sensing/camera/{name}/camera_info": name
+        for name in cam_names
+    }
+    saved = set()
+    with open(mcap_path, "rb") as f:
+        reader = make_reader(f)
+        for _schema, channel, message in reader.iter_messages(topics=list(info_topics.keys())):
+            name = info_topics.get(channel.topic)
+            if name is None or name in saved:
+                continue
+            msg = deserialize_message(message.data, CameraInfo)
+            info = {
+                "width":            msg.width,
+                "height":           msg.height,
+                "K":                np.array(msg.k).reshape(3, 3).tolist(),
+                "D":                list(msg.d),
+                "distortion_model": msg.distortion_model,
+            }
+            dst = out_root / name / "camera_info.json"
+            with open(dst, "w") as fp:
+                json.dump(info, fp, indent=2)
+            saved.add(name)
+            print(f"[cam] camera_info: {name} {msg.width}x{msg.height} "
+                  f"model={msg.distortion_model}", flush=True)
+            if saved >= set(cam_names):
+                break
 
 
 def main() -> int:
@@ -60,6 +94,9 @@ def main() -> int:
     out_root = Path(args.out_root)
     for name in cam_map.values():
         (out_root / name).mkdir(parents=True, exist_ok=True)
+
+    extract_camera_infos(args.mcap, list(cam_map.values()), out_root)
+
     counts = {name: 0 for name in cam_map.values()}
     collisions = 0
     t0 = time.time()
