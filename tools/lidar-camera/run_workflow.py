@@ -15,12 +15,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 
-# project_lidar_to_cam.py が対応しているカメラとペアの LiDAR
+# project_lidar_to_cam.py の CAM_CONFIGS から対応カメラとペア LiDAR を動的に取得
+sys.path.insert(0, str(SCRIPT_DIR))
+from project_lidar_to_cam import CAM_CONFIGS  # noqa: E402
+
 CAM_LIDAR_PAIRS = {
-    "camera2": "lidar_right",
-    "camera3": "lidar_right",
-    "camera6": "lidar_left",
-    "camera7": "lidar_left",
+    cam: Path(cfg["lidar"]).name
+    for cam, cfg in CAM_CONFIGS.items()
 }
 
 
