@@ -15,4 +15,4 @@ mcap
 
 # tune_extrinsic.py only
 PySide6
-matplotlib
+matplotlib>=3.7  # 3.7+ required for NumPy 2.x compatibility

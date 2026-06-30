@@ -129,23 +129,34 @@ class TunerWindow(QtWidgets.QMainWindow):
     ROT_STEP    = np.deg2rad(0.02)  # 0.02 deg
 
     def __init__(self, image, points, K, init_T, out_path,
-                 lidar_frame="lidar", cam_frame="camera"):
+                 lidar_frame="lidar", cam_frame="camera", intensity=None):
         super().__init__()
         self.setWindowTitle("LiDAR-Camera Extrinsic Tuner")
 
         self.image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
         self.h, self.w = self.image.shape[:2]
-        self.points = points.astype(np.float64)
-        self.K      = K.astype(np.float64)
-        self.T      = init_T.copy()
-        self.base_T = init_T.copy()
+        self.points    = points.astype(np.float64)
+        self.intensity = intensity.astype(np.float64) if intensity is not None else None
+        self.K         = K.astype(np.float64)
+        self.T         = init_T.copy()
+        self.base_T    = init_T.copy()
         self.out_path    = out_path
         self.lidar_frame = lidar_frame
         self.cam_frame   = cam_frame
 
-        self.pairs      = []
-        self.pending_3d = None
-        self.pair_mode  = False
+        self.pairs        = []
+        self.pending_3d   = None
+        self.pair_mode    = False
+        self.pair_submode = "match"   # "match" | "mismatch"
+
+        self.color_mode = "intensity" if intensity is not None else "depth"
+        self.pt_size    = 4
+        self.pt_alpha   = 0.7
+        self.depth_min  = -6.0
+        self.depth_max  = 30.0
+
+        self._panning          = False
+        self._view_initialized = False
 
         self._build_ui()
         self._sync_sliders_from_T()
@@ -158,10 +169,14 @@ class TunerWindow(QtWidgets.QMainWindow):
         layout  = QtWidgets.QHBoxLayout(central)
 
         self.fig    = Figure(figsize=(9, 7))
+        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
         self.canvas = FigureCanvas(self.fig)
         self.ax     = self.fig.add_subplot(111)
         self.ax.set_axis_off()
-        self.canvas.mpl_connect("button_press_event", self.on_click)
+        self.canvas.mpl_connect("button_press_event",   self._on_press)
+        self.canvas.mpl_connect("motion_notify_event",  self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+        self.canvas.mpl_connect("scroll_event",         self._on_scroll)
         layout.addWidget(self.canvas, stretch=3)
 
         panel = QtWidgets.QVBoxLayout()
@@ -203,11 +218,60 @@ class TunerWindow(QtWidgets.QMainWindow):
         panel.addWidget(rebase_btn)
 
         panel.addSpacing(10)
+        panel.addWidget(QtWidgets.QLabel("── 表示設定 ──"))
+
+        # color モード選択
+        color_row = QtWidgets.QHBoxLayout()
+        color_row.addWidget(QtWidgets.QLabel("color:"))
+        self._radio_inten = QtWidgets.QRadioButton("intensity")
+        self._radio_depth = QtWidgets.QRadioButton("depth")
+        self._radio_inten.setChecked(self.color_mode == "intensity")
+        self._radio_depth.setChecked(self.color_mode == "depth")
+        if self.intensity is None:
+            self._radio_inten.setEnabled(False)
+        self._radio_inten.toggled.connect(self._on_color_mode_change)
+        color_row.addWidget(self._radio_inten)
+        color_row.addWidget(self._radio_depth)
+        color_row.addStretch()
+        panel.addLayout(color_row)
+
+        disp_specs = [
+            ("size",  1,    30,  4,   lambda v: str(v)),
+            ("alpha", 1,   100, 70,   lambda v: f"{v/100:.2f}"),
+            ("c min", -100, 300, -6,  lambda v: str(v)),
+            ("c max", -100, 300, 30,  lambda v: str(v)),
+        ]
+        self._disp_sliders = {}
+        for name, lo, hi, default, fmt in disp_specs:
+            row   = QtWidgets.QHBoxLayout()
+            label = QtWidgets.QLabel(name)
+            label.setFixedWidth(65)
+            s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            s.setMinimum(lo); s.setMaximum(hi); s.setValue(default)
+            s.valueChanged.connect(self._on_disp_change)
+            val = QtWidgets.QLabel(fmt(default))
+            val.setFixedWidth(40)
+            self._disp_sliders[name] = dict(slider=s, fmt=fmt, label=val)
+            row.addWidget(label); row.addWidget(s); row.addWidget(val)
+            panel.addLayout(row)
+
+        panel.addSpacing(10)
 
         self.pair_btn = QtWidgets.QPushButton("ペアモード: OFF")
         self.pair_btn.setCheckable(True)
         self.pair_btn.toggled.connect(self.toggle_pair_mode)
         panel.addWidget(self.pair_btn)
+
+        submode_row = QtWidgets.QHBoxLayout()
+        self._radio_match    = QtWidgets.QRadioButton("一致点追加")
+        self._radio_mismatch = QtWidgets.QRadioButton("相違点追加")
+        self._radio_match.setChecked(True)
+        self._radio_match.setEnabled(False)
+        self._radio_mismatch.setEnabled(False)
+        self._radio_match.toggled.connect(self._on_pair_submode_change)
+        submode_row.addWidget(self._radio_match)
+        submode_row.addWidget(self._radio_mismatch)
+        panel.addLayout(submode_row)
 
         self.pair_label = QtWidgets.QLabel("ペア数: 0")
         panel.addWidget(self.pair_label)
@@ -274,11 +338,51 @@ class TunerWindow(QtWidgets.QMainWindow):
         self._update_slider_labels()
         self.redraw()
 
+    def _on_disp_change(self):
+        s = self._disp_sliders
+        self.pt_size   = s["size"]["slider"].value()
+        self.pt_alpha  = s["alpha"]["slider"].value() / 100.0
+        self.depth_min = float(s["c min"]["slider"].value())
+        self.depth_max = float(s["c max"]["slider"].value())
+        for cfg in s.values():
+            cfg["label"].setText(cfg["fmt"](cfg["slider"].value()))
+        self.redraw()
+
+    def _on_color_mode_change(self):
+        self.color_mode = "intensity" if self._radio_inten.isChecked() else "depth"
+        defaults = {"intensity": (-6, 30), "depth": (0, 50)}
+        lo, hi = defaults[self.color_mode]
+        for key, val in [("c min", lo), ("c max", hi)]:
+            sl = self._disp_sliders[key]["slider"]
+            sl.blockSignals(True)
+            sl.setValue(val)
+            sl.blockSignals(False)
+        self._on_disp_change()
+
     def toggle_pair_mode(self, checked):
         self.pair_mode  = checked
         self.pending_3d = None
         self.pair_btn.setText(f"ペアモード: {'ON' if checked else 'OFF'}")
-        self.status.setText("投影点をクリック → 正しい位置をクリック" if checked else "")
+        self._radio_match.setEnabled(checked)
+        self._radio_mismatch.setEnabled(checked)
+        self._update_pair_status()
+        if not checked:
+            self.redraw()
+
+    def _update_pair_status(self):
+        if not self.pair_mode:
+            self.status.setText("")
+            return
+        if self.pair_submode == "match":
+            self.status.setText("投影点をクリック → 現在の投影位置でペア登録")
+        else:
+            self.status.setText("投影点をクリック → 正しい画像位置をクリック")
+
+    def _on_pair_submode_change(self):
+        self.pair_submode = "match" if self._radio_match.isChecked() else "mismatch"
+        self.pending_3d   = None
+        self._update_pair_status()
+        self.redraw()
 
     def clear_pairs(self):
         self.pairs      = []
@@ -286,13 +390,59 @@ class TunerWindow(QtWidgets.QMainWindow):
         self.pair_label.setText("ペア数: 0")
         self.redraw()
 
+    # ---------- ズーム / パン ----------
+    def _on_press(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        if self.pair_mode:
+            self.on_click(event)
+            return
+        if event.button == 1:
+            self._pan_start_disp = (event.x, event.y)
+            self._pan_xlim = self.ax.get_xlim()
+            self._pan_ylim = self.ax.get_ylim()
+            self._panning  = True
+
+    def _on_motion(self, event):
+        if not self._panning or event.x is None:
+            return
+        bbox = self.ax.get_window_extent()
+        if bbox.width == 0 or bbox.height == 0:
+            return
+        # 元の座標系でのみ計算することでドラッグ中のドリフトを防ぐ
+        def disp2data(px, py):
+            rx = (px - bbox.x0) / bbox.width
+            ry = (py - bbox.y0) / bbox.height
+            return (self._pan_xlim[0] + rx * (self._pan_xlim[1] - self._pan_xlim[0]),
+                    self._pan_ylim[0] + ry * (self._pan_ylim[1] - self._pan_ylim[0]))
+        sx, sy = disp2data(*self._pan_start_disp)
+        cx, cy = disp2data(event.x, event.y)
+        dx, dy = cx - sx, cy - sy
+        self.ax.set_xlim(self._pan_xlim[0] - dx, self._pan_xlim[1] - dx)
+        self.ax.set_ylim(self._pan_ylim[0] - dy, self._pan_ylim[1] - dy)
+        self.canvas.draw_idle()
+
+    def _on_release(self, event):
+        self._panning = False
+
+    def _on_scroll(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+        scale = 0.85 ** event.step  # step>0=ズームイン, step<0=ズームアウト
+        cx, cy = event.xdata, event.ydata
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        self.ax.set_xlim(cx + (xlim[0] - cx) * scale, cx + (xlim[1] - cx) * scale)
+        self.ax.set_ylim(cy + (ylim[0] - cy) * scale, cy + (ylim[1] - cy) * scale)
+        self.canvas.draw_idle()
+
     def on_click(self, event):
         if event.inaxes != self.ax or event.xdata is None or not self.pair_mode:
             return
         click = np.array([event.xdata, event.ydata])
 
-        if self.pending_3d is None:
-            # 第1クリック: 最近傍の投影点の3D座標を保持
+        if self.pair_submode == "match":
+            # 1クリック: 最近傍の投影点を見つけ、現在の投影位置をペアとして登録
             uv, _depth, idx = project(self.points, self.T, self.K)
             if uv.shape[0] == 0:
                 return
@@ -300,16 +450,31 @@ class TunerWindow(QtWidgets.QMainWindow):
             if np.linalg.norm(uv[j] - click) > 30:
                 self.status.setText("近くに投影点がありません")
                 return
-            self.pending_3d = self.points[idx[j]].copy()
-            self.status.setText("正しい画像位置をクリックしてください")
-            self.redraw(highlight_uv=uv[j])
-        else:
-            # 第2クリック: 正しい画像位置でペア確定
-            self.pairs.append((self.pending_3d.copy(), click.copy()))
-            self.pending_3d = None
+            self.pairs.append((self.points[idx[j]].copy(), uv[j].copy()))
             self.pair_label.setText(f"ペア数: {len(self.pairs)}")
-            self.status.setText("ペア登録しました")
+            self.status.setText(f"一致点を登録しました (計{len(self.pairs)}組)")
             self.redraw()
+        else:
+            # 相違点: 2クリック
+            if self.pending_3d is None:
+                # 第1クリック: 最近傍の投影点の3D座標を保持
+                uv, _depth, idx = project(self.points, self.T, self.K)
+                if uv.shape[0] == 0:
+                    return
+                j = int(np.argmin(np.linalg.norm(uv - click, axis=1)))
+                if np.linalg.norm(uv[j] - click) > 30:
+                    self.status.setText("近くに投影点がありません")
+                    return
+                self.pending_3d = self.points[idx[j]].copy()
+                self.status.setText("正しい画像位置をクリックしてください")
+                self.redraw(highlight_uv=uv[j])
+            else:
+                # 第2クリック: 正しい画像位置でペア確定
+                self.pairs.append((self.pending_3d.copy(), click.copy()))
+                self.pending_3d = None
+                self.pair_label.setText(f"ペア数: {len(self.pairs)}")
+                self.status.setText(f"相違点を登録しました (計{len(self.pairs)}組)")
+                self.redraw()
 
     def run_pnp(self):
         if len(self.pairs) < 4:
@@ -373,16 +538,30 @@ class TunerWindow(QtWidgets.QMainWindow):
 
     # ---------- 描画 ----------
     def redraw(self, highlight_uv=None):
+        if self._view_initialized:
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+        else:
+            xlim = (0, self.w)
+            ylim = (self.h, 0)
+            self._view_initialized = True
+
         self.ax.clear()
         self.ax.set_axis_off()
         self.ax.imshow(self.image)
 
-        uv, depth, _ = project(self.points, self.T, self.K)
+        uv, depth, idx = project(self.points, self.T, self.K)
         if uv.shape[0]:
             inb = ((uv[:, 0] >= 0) & (uv[:, 0] < self.w) &
                    (uv[:, 1] >= 0) & (uv[:, 1] < self.h))
+            if self.color_mode == "intensity" and self.intensity is not None:
+                color_vals = self.intensity[idx[inb]]
+            else:
+                color_vals = depth[inb]
             self.ax.scatter(uv[inb, 0], uv[inb, 1],
-                            c=depth[inb], cmap="jet_r", s=4, alpha=0.7)
+                            c=color_vals, cmap="jet_r",
+                            s=self.pt_size, alpha=self.pt_alpha,
+                            vmin=self.depth_min, vmax=self.depth_max)
 
         for _, target in self.pairs:
             self.ax.plot(target[0], target[1], "g+", markersize=12, mew=2)
@@ -391,8 +570,8 @@ class TunerWindow(QtWidgets.QMainWindow):
             self.ax.plot(highlight_uv[0], highlight_uv[1],
                          "wo", markersize=10, mfc="none", mew=2)
 
-        self.ax.set_xlim(0, self.w)
-        self.ax.set_ylim(self.h, 0)
+        self.ax.set_xlim(xlim)
+        self.ax.set_ylim(ylim)
         self.canvas.draw_idle()
 
         err = self.pair_reproj_error()
@@ -422,13 +601,15 @@ def load_inputs(args):
     # 点群 (.pcd は extract_lidar_pcd.py の出力、.npy は Nx3 以上の配列)
     p = Path(args.points)
     if p.suffix == ".pcd":
-        xyz, _ = read_pcd_xyzi(str(p))
+        xyz, inten = read_pcd_xyzi(str(p))
         pts = xyz
+        intensity = inten
     else:
         raw = np.load(args.points)
         if raw.ndim != 2 or raw.shape[1] < 3:
             raise ValueError("--points は Nx3 以上の .npy が必要")
         pts = raw[:, :3].astype(np.float64)
+        intensity = raw[:, 3].astype(np.float64) if raw.shape[1] >= 4 else None
 
     # カメラ行列 new_K: --cam-dir (camera_info.json) 優先、次に --K
     if args.cam_dir:
@@ -437,8 +618,9 @@ def load_inputs(args):
             raise FileNotFoundError(f"camera_info.json が見つかりません: {args.cam_dir}")
         _K, _D, _W, _H, info_model, _P = cam_info
         _model = args.distortion_model or info_model
-        new_K, _, _, _ = build_undistort(_K, _D, _W, _H, _model, P=_P)
-        print(f"[tuner] camera_info: {_W}x{_H} model={_model}", flush=True)
+        new_K, map1, map2, _ = build_undistort(_K, _D, _W, _H, _model, P=_P, fisheye_balance=None)
+        img = cv2.remap(img, map1, map2, cv2.INTER_LINEAR)
+        print(f"[tuner] camera_info: {_W}x{_H} model={_model} (undistort applied)", flush=True)
     elif args.K:
         if args.K.endswith(".npy"):
             new_K = np.load(args.K).astype(np.float64)
@@ -471,7 +653,7 @@ def load_inputs(args):
     else:
         init_T = np.eye(4)
 
-    return img, pts, new_K, init_T, lidar_frame or "lidar", cam_frame
+    return img, pts, new_K, init_T, lidar_frame or "lidar", cam_frame, intensity
 
 
 # ----------------------------------------------------------------------------
@@ -480,7 +662,7 @@ def load_inputs(args):
 def main():
     ap = argparse.ArgumentParser(description="LiDAR-Camera 外部パラメータ 手動調整GUI")
     ap.add_argument("--image",   required=True,
-                    help="補正済み画像 (project_lidar_to_cam.py の undistort/ 出力など)")
+                    help="カメラ画像 (image_raw / distort/ 等)。--cam-dir 使用時は自動的に歪み補正を適用")
     ap.add_argument("--points",  required=True,
                     help="LiDAR 点群 (.npy Nx3 または extract_lidar_pcd.py 出力 .pcd)")
     ap.add_argument("--cam-dir", default=None,
@@ -506,11 +688,12 @@ def main():
                     help="出力 YAML パス (デフォルト: extrinsic_adjust.yaml)")
     args = ap.parse_args()
 
-    img, pts, K, init_T, lidar_frame, cam_frame = load_inputs(args)
+    img, pts, K, init_T, lidar_frame, cam_frame, intensity = load_inputs(args)
 
     app = QtWidgets.QApplication(sys.argv)
     win = TunerWindow(img, pts, K, init_T, args.out,
-                      lidar_frame=lidar_frame, cam_frame=cam_frame)
+                      lidar_frame=lidar_frame, cam_frame=cam_frame,
+                      intensity=intensity)
     win.resize(1280, 760)
     win.show()
     sys.exit(app.exec())

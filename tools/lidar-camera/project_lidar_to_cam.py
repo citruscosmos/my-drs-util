@@ -213,20 +213,27 @@ def _load_tf_yaml(yaml_path, base_dir=None):
     return configs
 
 
-def build_undistort(K, D, img_w, img_h, distortion_model, P=None):
+def build_undistort(K, D, img_w, img_h, distortion_model, P=None, fisheye_balance=1.0):
     """モデルに応じた (new_K, map1, map2, project_fn) を返す。
 
     project_fn(pts_Nx3) -> uv_Nx2: カメラ座標系の点をピクセル座標へ投影する関数。
     入力画像は常に image_raw を前提とし、常に remap を行う。
+
+    fisheye_balance: equidistant モデル時の balance 値 (0.0〜1.0)。
+                     1.0 = 全画素が見えるフル FOV (デフォルト)。
+                     None = 元の K をそのまま使用 (焦点距離を保ちたいキャリブ GUI 向け)。
     """
     if distortion_model == "equidistant":
         if D.size < 4:
             raise ValueError("equidistant モデルには D が 4 係数以上必要です")
         D4 = D[:4].reshape(4, 1)
 
-        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            K, D4, (img_w, img_h), np.eye(3), balance=1.0,
-            new_size=(img_w, img_h))
+        if fisheye_balance is None:
+            new_K = K.copy()
+        else:
+            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                K, D4, (img_w, img_h), np.eye(3), balance=fisheye_balance,
+                new_size=(img_w, img_h))
         map1, map2 = cv2.fisheye.initUndistortRectifyMap(
             K, D4, np.eye(3), new_K, (img_w, img_h), cv2.CV_16SC2)
 
