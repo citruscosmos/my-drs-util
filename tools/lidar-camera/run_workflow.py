@@ -17,12 +17,7 @@ SCRIPT_DIR = Path(__file__).parent
 
 # project_lidar_to_cam.py の CAM_CONFIGS から対応カメラとペア LiDAR を動的に取得
 sys.path.insert(0, str(SCRIPT_DIR))
-from project_lidar_to_cam import CAM_CONFIGS  # noqa: E402
-
-CAM_LIDAR_PAIRS = {
-    cam: Path(cfg["lidar"]).name
-    for cam, cfg in CAM_CONFIGS.items()
-}
+from project_lidar_to_cam import CAM_CONFIGS, _load_tf_yaml  # noqa: E402
 
 
 def run_step(cmd, description):
@@ -50,7 +45,17 @@ def main():
                     help="カメラ歪みモデル強制指定 (省略時は各カメラの camera_info.json から自動検出)")
     ap.add_argument("--alpha", type=float, default=0.45,
                     help="投影点の不透明度 (0~1)")
+    ap.add_argument("--tf-yaml", default=None,
+                    help="multi_tf_static.yaml から外部パラメータを読み込む (省略時はハードコード値を使用)")
     args = ap.parse_args()
+
+    cam_configs = _load_tf_yaml(args.tf_yaml) if args.tf_yaml else CAM_CONFIGS
+    cam_lidar_pairs = {
+        cam: Path(cfg["lidar"]).name
+        for cam, cfg in cam_configs.items()
+    }
+    if args.tf_yaml:
+        print(f"[workflow] tf_yaml : {args.tf_yaml} ({len(cam_configs)} cameras)", flush=True)
 
     mcap_path = Path(args.mcap).resolve()
     if not mcap_path.exists():
@@ -88,7 +93,7 @@ def main():
 
     # ---- Step 3: LiDAR→カメラ投影 ----
     projected = 0
-    for cam, lidar_name in CAM_LIDAR_PAIRS.items():
+    for cam, lidar_name in cam_lidar_pairs.items():
         cam_dir   = proj_dir / cam
         lidar_dir = proj_dir / lidar_name
 
@@ -100,12 +105,13 @@ def main():
             continue
 
         dm_opts = ["--distortion-model", args.distortion_model] if args.distortion_model else []
+        tf_opts = ["--tf-yaml", args.tf_yaml] if args.tf_yaml else []
         run_step(
             [sys.executable, SCRIPT_DIR / "project_lidar_to_cam.py",
              cam, str(proj_dir / f"proj_{cam}"),
              "--cam-dir",   str(cam_dir),
              "--lidar-dir", str(lidar_dir),
-             "--alpha",     str(args.alpha)] + dm_opts + ts_opts,
+             "--alpha",     str(args.alpha)] + dm_opts + tf_opts + ts_opts,
             f"Step 3/3: LiDAR→カメラ投影 ({cam})",
         )
         projected += 1

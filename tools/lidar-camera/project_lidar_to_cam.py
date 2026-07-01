@@ -139,6 +139,49 @@ T2_q = np.array([0.5, -0.5, 0.5, -0.5])  # x,y,z,w
 IMIN, IMAX = 0.0, 40.0
 
 
+def _q_to_rpy(q):
+    """クォータニオン (x,y,z,w) -> RPY (rad) ZYX extrinsic"""
+    x, y, z, w = q / np.linalg.norm(q)
+    roll  = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
+    yaw   = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return roll, pitch, yaw
+
+
+def draw_tf_overlay(img, cam_name, cfg, distortion_model):
+    """TFパラメータをデバッグ用に画像左下に半透過テキストで描画する。"""
+    t = cfg["t"]
+    r, p, y = _q_to_rpy(cfg["q"])
+    lines = [
+        f"cam={cam_name}  model={distortion_model}",
+        f"t  x={t[0]:+.4f}  y={t[1]:+.4f}  z={t[2]:+.4f}",
+        f"R  r={np.degrees(r):+.3f}  p={np.degrees(p):+.3f}  y={np.degrees(y):+.3f} [deg]",
+    ]
+
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.4
+    thick = 1
+    pad   = 6
+    lh    = 16  # line height px
+
+    max_w   = max(cv2.getTextSize(ln, font, scale, thick)[0][0] for ln in lines)
+    box_h   = lh * len(lines) + pad * 2
+    box_w   = max_w + pad * 2
+    h, w    = img.shape[:2]
+    x0, y0  = pad, h - box_h - pad
+
+    # 半透過の黒背景
+    roi = img[y0:y0 + box_h, x0:x0 + box_w]
+    img[y0:y0 + box_h, x0:x0 + box_w] = cv2.addWeighted(
+        roi, 0.35, np.zeros_like(roi), 0.65, 0)
+
+    for i, line in enumerate(lines):
+        ty = y0 + pad + lh * (i + 1) - 3
+        cv2.putText(img, line, (x0 + pad, ty),
+                    font, scale, (210, 210, 210), thick, cv2.LINE_AA)
+    return img
+
+
 def quat_to_R(q):
     x, y, z, w = q
     n = np.linalg.norm([x, y, z, w])
@@ -318,7 +361,7 @@ def run(cam, out_root, sample, limit, alpha, start_ns, end_ns,
         print(f"[proj] camera_info not found, using default intrinsics "
               f"(model={_model})", flush=True)
 
-    new_K, map1, map2, project_fn = build_undistort(_K, _D, _W, _H, _model, P=_P)
+    new_K, map1, map2, project_fn = build_undistort(_K, _D, _W, _H, _model, P=_P, fisheye_balance=None)
     nfx, nfy = new_K[0, 0], new_K[1, 1]
     ncx, ncy = new_K[0, 2], new_K[1, 2]
 
@@ -376,6 +419,9 @@ def run(cam, out_root, sample, limit, alpha, start_ns, end_ns,
             u = nfx * p_col[:, 0] / p_col[:, 2] + ncx
             v = nfy * p_col[:, 1] / p_col[:, 2] + ncy
             draw_points(img_un, u, v, colors, alpha=alpha)
+
+        draw_tf_overlay(img_di, cam, cfg, _model)
+        draw_tf_overlay(img_un, cam, cfg, _model)
 
         name = f"{lts}.jpg"
         cv2.imwrite(str(out_di / name), img_di, [cv2.IMWRITE_JPEG_QUALITY, 95])
