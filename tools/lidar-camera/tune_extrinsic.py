@@ -390,9 +390,9 @@ class TunerWindow(QtWidgets.QMainWindow):
             self.status.setText("")
             return
         if self.pair_submode == "match":
-            self.status.setText("投影点をクリック → 現在の投影位置でペア登録")
+            self.status.setText("左クリック: 投影点を選択してペア登録 / 右クリック: ペアを削除")
         else:
-            self.status.setText("投影点をクリック → 正しい画像位置をクリック")
+            self.status.setText("左クリック: 投影点 → 正しい位置の順でクリック / 右クリック: ペアを削除")
 
     def _on_pair_submode_change(self):
         self.pair_submode = "match" if self._radio_match.isChecked() else "mismatch"
@@ -406,12 +406,31 @@ class TunerWindow(QtWidgets.QMainWindow):
         self.pair_label.setText("ペア数: 0")
         self.redraw()
 
+    def _delete_nearest_pair(self, click):
+        if not self.pairs:
+            self.status.setText("削除するペアがありません")
+            return
+        targets = np.array([p[1] for p in self.pairs])
+        dists   = np.linalg.norm(targets - click, axis=1)
+        j       = int(np.argmin(dists))
+        if dists[j] > 30:
+            self.status.setText("近くにペアがありません (30px 以内を右クリック)")
+            return
+        self.pairs.pop(j)
+        self.pending_3d = None
+        self.pair_label.setText(f"ペア数: {len(self.pairs)}")
+        self.status.setText(f"ペア #{j + 1} を削除しました (残り {len(self.pairs)} 組)")
+        self.redraw()
+
     # ---------- ズーム / パン ----------
     def _on_press(self, event):
         if event.inaxes != self.ax or event.xdata is None:
             return
         if self.pair_mode:
-            self.on_click(event)
+            if event.button == 3:
+                self._delete_nearest_pair(np.array([event.xdata, event.ydata]))
+            elif event.button == 1:
+                self.on_click(event)
             return
         if event.button == 1:
             self._pan_start_disp = (event.x, event.y)
