@@ -1,0 +1,20 @@
+# Auto-calibration pipeline — Python dependencies.
+#
+# These are installed into a CLEAN venv (no --system-site-packages), because the
+# machine's ~/.local is internally inconsistent (numpy 2.x + opencv requiring
+# numpy>=2 + system scipy requiring numpy<1.25, so scipy is broken there).
+#
+# rclpy and the ROS message packages (sensor_msgs, nav_msgs, tf2_msgs,
+# oxts_msgs) are NOT pip-installable — they come from ROS 2 Humble. Source it
+# before running so they appear on PYTHONPATH:
+#     source /opt/ros/humble/setup.bash
+# The venv (numpy 1.24) is ABI-compatible with Humble's rclpy; verified by
+# deserializing real Odometry/PointCloud2 messages.
+
+numpy==1.24.4          # <1.25 so scipy imports; >=1.24 for np.ptp() etc.
+scipy==1.10.1          # Step 5/6 L-BFGS-B; broken under numpy 2.x on this host
+open3d==0.18.0         # Step 4 multi-scale ICP
+opencv-python==4.9.0.80  # Step 5 Canny/undistort/fisheye; numpy 1.x compatible (4.13 needs numpy>=2)
+mcap>=1.0              # bag reading
+mcap-ros2-support>=0.5
+pyyaml>=6.0            # config.yaml / TF YAML
