@@ -158,6 +158,49 @@ def _scan_pose(traj, t0_ns, drs_T_lidar):
     return map_T_lidar[:3, :3], map_T_lidar[:3, 3]
 
 
+# int64 packing for the two arc-length bin indices of the occlusion range
+# image (see vote_occlusion_footprint_m). 26 bits/axis, offset-biased so
+# indices in [-2^25, 2^25) map to non-negative fields; generous headroom for
+# a 60m-range, 120deg-FOV arc-length extent at sub-decimeter footprints.
+_OCC_KEY_BITS = 26
+_OCC_KEY_MASK = (1 << _OCC_KEY_BITS) - 1
+_OCC_KEY_OFFSET = 1 << (_OCC_KEY_BITS - 1)
+
+
+def _pack_occ_keys(key_az: np.ndarray, key_el: np.ndarray) -> np.ndarray:
+    a = (key_az + _OCC_KEY_OFFSET) & _OCC_KEY_MASK
+    b = (key_el + _OCC_KEY_OFFSET) & _OCC_KEY_MASK
+    return (a.astype(np.int64) << _OCC_KEY_BITS) | b.astype(np.int64)
+
+
+def _arc_length_keys(az, el, r, footprint_m):
+    """Bin by metric arc-length (angle * that point's own range) instead of
+    raw angle, so the bin footprint is ~constant in meters at any range
+    (see vote_occlusion_footprint_m's config comment for why)."""
+    key_az = np.floor((az * r) / footprint_m).astype(np.int64)
+    key_el = np.floor((el * r) / footprint_m).astype(np.int64)
+    return _pack_occ_keys(key_az, key_el)
+
+
+def _range_image(xyz, haz, hel, footprint_m):
+    """Per-scan sparse min-range lookup keyed by arc-length bin, in the
+    LiDAR's own sensor frame (xyz here is pre-world-transform, i.e. already
+    sensor-local). Returns (sorted_keys, min_range_per_key)."""
+    r = np.linalg.norm(xyz, axis=1)
+    m = r > 1e-6
+    x, y, z, r = xyz[m, 0], xyz[m, 1], xyz[m, 2], r[m]
+    az = np.arctan2(y, x)
+    el = np.arctan2(z, np.hypot(x, y))
+    infov = (np.abs(az) <= haz) & (np.abs(el) <= hel)
+    if not np.any(infov):
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+    keys = _arc_length_keys(az[infov], el[infov], r[infov], footprint_m)
+    uk, inv = np.unique(keys, return_inverse=True)
+    minr = np.full(len(uk), np.inf, dtype=np.float64)
+    np.minimum.at(minr, inv, r[infov])
+    return uk, minr
+
+
 def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verbose=True):
     """Accumulate one LiDAR's undistorted scans into a visibility-voted voxel map.
 
@@ -169,9 +212,15 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
     manifest = load_scan_manifest(out_dir, lidar)
     scan_dir = os.path.join(out_dir, "undistorted", lidar)
 
+    occlusion_on = bool(cfg.get("vote_occlusion_enabled", True))
+    haz = np.deg2rad(float(cfg["vote_hfov_deg"]) / 2.0)
+    hel = np.deg2rad(float(cfg["vote_vfov_deg"]) / 2.0)
+    footprint_m = float(cfg["vote_occlusion_footprint_m"])
+
     acc = _VoxelAccumulator()
     origins = []
     rots = []
+    range_grids = [] if occlusion_on else None
     used = 0
     for i, s in enumerate(manifest["scans"]):
         if i % stride != 0:
@@ -188,6 +237,8 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
         ijk = np.floor(world / voxel).astype(np.int64)
         keys = pack_voxel_keys(ijk)
         acc.add_scan(keys, world, inten)
+        if occlusion_on:
+            range_grids.append(_range_image(xyz, haz, hel, footprint_m))
         origins.append(o_m)
         rots.append(R_ml)
         used += 1
@@ -198,7 +249,7 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
     origins = np.asarray(origins, dtype=np.float64)
     rots = np.asarray(rots, dtype=np.float64)
 
-    visible = _visibility_counts(centers, origins, rots, cfg)
+    visible = _visibility_counts(centers, origins, rots, cfg, range_grids, footprint_m)
     # A voxel is always visible to at least the scans that occupied it.
     denom = np.maximum(visible, occ)
     ratio = np.where(denom > 0, occ / denom, 0.0)
@@ -267,8 +318,12 @@ def _range_masks_gpu(centers, origins, rmax2, rmin2, device, cfg):
     return masks
 
 
-def _visibility_counts(centers, origins, rots, cfg):
-    """For each voxel, count scans whose range+FOV cone contains its center."""
+def _visibility_counts(centers, origins, rots, cfg, range_grids=None, footprint_m=0.0):
+    """For each voxel, count scans that could have hit it: within range+FOV of
+    the scan origin, AND (if occlusion checking is enabled) not blocked by a
+    closer actual return in the same arc-length bin of that scan's own range
+    image. Without occlusion checking this reduces to the plain range+FOV
+    cone test (kept as a fallback / A-B toggle via vote_occlusion_enabled)."""
     n = len(centers)
     visible = np.zeros(n, dtype=np.int64)
     if n == 0 or len(origins) == 0:
@@ -277,6 +332,8 @@ def _visibility_counts(centers, origins, rots, cfg):
     rmin2 = float(cfg["vote_min_range"]) ** 2
     haz = np.deg2rad(float(cfg["vote_hfov_deg"]) / 2.0)
     hel = np.deg2rad(float(cfg["vote_vfov_deg"]) / 2.0)
+    occlusion_on = bool(cfg.get("vote_occlusion_enabled", True)) and range_grids is not None
+    tol = float(cfg.get("vote_occlusion_tol", 0.5))
 
     device = _gpu_device(cfg)
     range_masks = (_range_masks_gpu(centers, origins, rmax2, rmin2, device, cfg) if device is not None
@@ -289,10 +346,28 @@ def _visibility_counts(centers, origins, rots, cfg):
         idx = np.nonzero(m)[0]
         d = centers[idx] - origins[k]
         ds = d @ R_ml  # world -> sensor frame (R_ml.T @ d == d @ R_ml)
-        az = np.abs(np.arctan2(ds[:, 1], ds[:, 0]))
-        el = np.abs(np.arctan2(ds[:, 2], np.hypot(ds[:, 0], ds[:, 1])))
-        in_fov = (az <= haz) & (el <= hel)
-        visible[idx[in_fov]] += 1
+        rng = np.linalg.norm(ds, axis=1)
+        az = np.arctan2(ds[:, 1], ds[:, 0])
+        el = np.arctan2(ds[:, 2], np.hypot(ds[:, 0], ds[:, 1]))
+        in_fov = (np.abs(az) <= haz) & (np.abs(el) <= hel)
+        if not np.any(in_fov):
+            continue
+        vis_idx = idx[in_fov]
+        if occlusion_on:
+            uk, minr = range_grids[k]
+            cand_keys = _arc_length_keys(az[in_fov], el[in_fov], rng[in_fov], footprint_m)
+            if len(uk) == 0:
+                not_occluded = np.zeros(len(cand_keys), dtype=bool)
+            else:
+                pos = np.clip(np.searchsorted(uk, cand_keys), 0, len(uk) - 1)
+                found = uk[pos] == cand_keys
+                measured = np.where(found, minr[pos], np.inf)
+                # A bin with no return at all (inf) is treated as no evidence
+                # of visibility, not as "nothing closer so it must be
+                # visible" -- see the vote_occlusion_enabled config comment.
+                not_occluded = found & (measured >= (rng[in_fov] - tol))
+            vis_idx = vis_idx[not_occluded]
+        visible[vis_idx] += 1
     return visible
 
 

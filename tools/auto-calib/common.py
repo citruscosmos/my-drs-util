@@ -438,6 +438,28 @@ DEFAULT_CONFIG = {
     "vote_min_range": 1.5,
     "vote_hfov_deg": 120.0,
     "vote_vfov_deg": 40.0,
+    # Occlusion-aware visibility (2026-07-04): the plain range+FOV cone has no
+    # line-of-sight model, so on a tight-loop path it counts a near-path voxel
+    # as "visible" from dozens of other loop positions up to vote_max_range
+    # away even though the ground/other structure actually blocked the view
+    # from there. That inflated visible denominator votes out nearly all
+    # near-path structure (confirmed empirically: median occ 2-8 vs. median
+    # visible 120-150 within 40m of the driven path). Fix: build a per-scan
+    # min-range lookup from that scan's own real returns (in the sensor
+    # frame, pre-world-transform), keyed by metric arc-length bins (azimuth/
+    # elevation angle * that point's own range, so the bin footprint is a
+    # constant ~vote_occlusion_footprint_m at any range -- a fixed angular
+    # bin width was tried first, but couples near-field recovery to far-field
+    # filter strength since its physical footprint scales with range; see
+    # docs/architecture.md Step 3 notes). A voxel only counts as "visible"
+    # for a scan if that scan actually measured a return in the same bin at
+    # >= the voxel's own range (nothing closer was hit there) -- not merely
+    # "geometrically within range+FOV of the origin". A bin with no return at
+    # all is treated as no evidence (not visible), since a directional gap is
+    # more often sensor scan-pattern sparsity than true occlusion.
+    "vote_occlusion_enabled": True,
+    "vote_occlusion_footprint_m": 0.15,  # target per-bin physical footprint [m]
+    "vote_occlusion_tol": 0.5,          # [m] slack: visible if measured range >= voxel range - tol
     # Step 4 (lidar-to-lidar extrinsic; multi-scan point-to-plane Gauss-Newton
     # against the front map, coarse-to-fine over icp_multiscale_voxels).
     "icp_multiscale_voxels": [0.5, 0.2, 0.1],
