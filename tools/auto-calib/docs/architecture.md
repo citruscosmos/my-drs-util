@@ -756,6 +756,10 @@ Step 6 は 15 本の TF を変数として、**3種類の残差項**の無次元
 
 ## 処理時間の見積もり
 
+> **下記は実装前の見積もり**（2分bag・RTX3060 前提の推測値、Step 5 以降は未実装のため実測なし）。
+> Step 2-4 の実測値・実際のボトルネックは「処理高速化: 実測プロファイリングと対応」節を参照
+> （検証bag は 150秒・8の字全区間で条件が異なるため、下表と直接比較しないこと）。
+
 ### 前提条件
 
 - rosbag: 2 分間（≈ 20〜28 GB on disk）
@@ -807,7 +811,8 @@ GPU 版: Step 5a/5b が依然として最大 (30〜40%)
 | パラメータ | デフォルト | 精度重視 | 速度重視 | 説明 |
 |---|---|---|---|---|
 | **共通** | | | | |
-| `use_gpu` | `true` | `true` | `true` | GPU 使用フラグ（CUDA 未検出時は自動で CPU フォールバック） |
+| `gpu_enabled` | `true` | `true` | `true` | GPU 使用フラグ（現状 Step 3 の `_visibility_counts` のみ対応。CUDA 未検出時は自動で CPU フォールバック） |
+| `gpu_visibility_chunk_scans` | `32` | `32` | `32` | Step 3 GPU 経路でバッチ処理する scan 数（VRAM 使用量の上限を決める） |
 | `cpu_workers` | `4` | `4` | `8` | multiprocessing ワーカー数 |
 | **Step 0** | | | | |
 | `rtk_cov_warn_m2` | `0.1` | `0.1` | `0.1` | RTK covariance 位置分散の警告閾値 [m²]（超過は警告のみ・停止しない） |
@@ -935,60 +940,41 @@ lidar_front:
 
 ---
 
-## GPU 高速化
+## 処理高速化: 実測プロファイリングと対応（Step 2-4・2026-07-04）
 
-GPU (CUDA) が有効な環境では以下のように各ステップを高速化できる。
-実行時に `torch.cuda.is_available()` または `cupy.is_available()` で自動判定し、
-CPU フォールバックを設ける。
+> 下記「GPU 高速化」節（旧版）は実装前の**推測**（torch/cupy 前提、Step 4 は Open3D ICP を使う想定）だったが、
+> 実データでの `cProfile` 実測の結果、想定と異なるボトルネックが判明した。本節が現状の正しい記述で、
+> 旧節の想定（Step 2/3 の点群変換、Step 4 の Open3D ICP）は**外れ**（詳細は下記）。以降は実測ベースで更新する。
 
-| ステップ | GPU 化対象 | 手段 | 期待効果 |
+**検証環境**: bag `HRdqo3pf_2026-06-10T15-22-51.mcap`（8の字・全区間、51GB、1507 scans/lidar）、
+CPU 22 コア、GPU RTX 4070 Laptop (8GB, CUDA 12.9)、`torch`/`cupy` は未導入・`open3d==0.18.0`（CUDA tensor 利用可）。
+
+### 実測ボトルネック（`cProfile`、100-150 scan サブセットで測定）
+
+| Step | 支配的コスト | 実測内訳 | GPU の可否 |
 |---|---|---|---|
-| Step 2 (undistortion) | 点群全点への変換行列適用 | CuPy / PyTorch `torch.bmm` | スキャン処理時間 5〜10× 短縮 |
-| Step 3 (map building) | 点群座標変換・蓄積 | CuPy / Open3D CUDA tensor | マップ構築時間 3〜5× 短縮 |
-| Step 4 (ICP) | ICP 内部の最近傍探索・行列演算 | `open3d.t.pipelines.registration` (CUDA テンソル API) | 反復1回あたり 5〜20× 短縮 |
-| Step 5a/5b (投影コスト評価) | 点群投影・距離場参照のバッチ処理 | CuPy / PyTorch | 最適化イテレーション 3〜8× 短縮 |
-| Step 5a (Distance Transform) | 距離場生成 | `cv2.cuda` は非対応のため CPU のまま (フレームごとに一度のみ実行なので影響小) | — |
-| Step 6 (joint optimize) | ヤコビアン計算 | PyTorch autograd | 勾配計算を自動微分化・GPU 並列化 |
+| 2 (undistort) | bag I/O（mcap 読込 + zstd 展開）が最大 | 200 scan/25s 中: I/O 34%、姿勢補間(quat slerp, numpy既にベクトル化済み) 30% | **不向き**: I/O が支配的で GPU 化しても math の 30% しか削れない |
+| 3 (build_front_map) | ①`_VoxelAccumulator` の逐次 dict マージ ②可視性判定 `_visibility_counts` | 修正前: 100 scan/12.5s 中 ① 62%（Python `dict.get()` を voxel 毎に呼ぶ generator、100 scan で 480 万回） ② 32%（Python for ループで n_voxels×n_scans の距離+FOV判定） | ①は GPU 無関係（純アルゴリズム） ②は embarrassingly parallel で GPU 向き |
+| 4 (lidar_to_lidar) | `map_blocks`（同一 front map の木を共有する 503 個）を**個別に** `cKDTree.query(workers=-1)` していたことによる**スレッドプール生成オーバーヘッド** | 150 scan/777s 中: `cKDTree.query` 79%（うち大半がPythonの`threading`機構、`_thread.lock.acquire`だけで416s） | GPU 化ではなく**呼び出し回数を減らす**のが正解。GPU 化するなら Open3D tensor 最近傍探索への全面書き換えが必要（自前の Huber-LM・縮退方向射影ロジックは移植対象外＝リスク大） |
 
-### Open3D CUDA ICP (Step 4) の使い方
+### 実施した対応と実測効果（フル 503 scan、同一 bag・同一 tf で検証、全て結果の数値一致を確認済み）
 
-```python
-import open3d as o3d
+| 対応 | 内容 | Before → After | 検証方法 |
+|---|---|---|---|
+| Step 4: クエリ一括化 | `map_blocks` は全員同じ `tree` を参照しているため、`id(tree)` でグループ化し**同じ木への複数ブロックのクエリを 1 回にまとめる**（`inter_blocks` は木がブロック毎に異なるため対象外、従来通り個別クエリ） | **1549.6s → 1210.2s（-22%）** | `lidar_to_lidar_result.json` が変更前と bit 完全一致 |
+| Step 3-1: `add_scan` の numpy 一括化 | 各 scan は従来通り `np.unique` でローカル重複排除するが、**scan 間のマージを逐次 dict ではなく全 scan 分をリストに貯めて最後に 1 回だけグローバル `np.unique`** で行う（`occ` は「各 scan が自身の voxel key をちょうど 1 回だけ寄与する」性質を使い、グローバル unique 後の出現回数でそのまま計算） | **209.0s → 180.5s（-14%）** | 合成データでブルートフォース dict 参照実装と centers/intensity/occ 完全一致を確認。実データでも raw/kept voxel 数が変更前と完全一致 |
+| Step 3-2: `_visibility_counts` の GPU 化 | 距離+レンジ判定のみを Open3D CUDA tensor でスキャン `gpu_visibility_chunk_scans`（既定 32）件ずつバッチ化。**boolean mask だけを CPU に転送**し、その後の FOV角度判定(`arctan2`)は従来通り CPU/numpy のまま（対象点数が既にレンジフィルタ後の小さい部分集合のため）。`gpu_enabled`（既定 true）で有効・CUDA 無ければ自動で CPU 経路にフォールバック | **180.5s → 167.5s（-7%）** | raw/kept voxel 数完全一致。生成点群もソート後に完全一致（行順序のみ非決定的に入れ替わるが下流はKDTree構築にしか使わないため無害） |
+| viz.py: 凡例マーカーサイズ | `ax.legend(markerscale=10)` が疎点群(s=0.15-3)向けの拡大率を、start/end 等の大きい注釈マーカー(s=80)にも一律適用し、凡例アイコンが肥大化してテキストと重なる不具合。**凡例マーカーサイズを一律 50 に正規化**する方式に変更（全 Step 共通のプロット凡例に反映） | — | Step1 trajectory 等で目視確認 |
+| Step 2: 単一読み込み + lidar 別並列処理 | 従来は 4 lidar 分、`process_lidar()` が独立して `common.iter_messages(files, [topic])` を呼び、**51GB の bag 全体を実質 4 回、逐次的に読み直していた**（mcap の `SeekingReader` はチャンク単位の索引を持つが、4 lidar は同時録画のため大半のチャンクに全 lidar のメッセージが混在しており、チャンクスキップによる I/O 削減は効かない）。`read_lidar_buffers()` で **bag を 1 回だけ走査**し（`log_time_order=True` により topics を跨いでも各 lidar 自身の相対順序は従来と不変）、4 lidar 分の生メッセージ（未デシリアライズ）を `(idx, raw_bytes)` としてバッファ、その後 `multiprocessing.get_context("fork")` で **4 lidar を並列プロセスとして** undistort + 書き出し（fork なのでバッファは copy-on-write 継承・pickle 転送なし） | **796.3s → 272.1s（-66%）** | フルスケール（1507 scan×4 lidar）で `undistorted/<lidar>/*.npy` + `manifest.json` が変更前と完全一致（`diff -rq` 差分ゼロ）。中間スケール（400 scan）・部分 lidar+stride 指定でも別途完全一致を確認 |
 
-device = o3d.core.Device("CUDA:0")  # GPU 有効時
+**Step 2 合計: 796.3s → 272.1s（-66%）、Step 3 合計: 209.0s → 167.5s（-20%）、Step 4: 1549.6s → 1210.2s（-22%）。フルパイプライン（Step0-4合計 2710.6s）換算で約 994秒（約37%）短縮**。
+Step 3/4 はいずれも cProfile 実測（100-150 scan サブセット）が示す割合ほど劇的な改善にはならなかった（Step 3 add_scan 62%→実質-14%、Step 4 スレッド管理 79%→実質-22%）。
+これは cProfile 自体のオーバーヘッドが「呼び出し回数の多い処理」を計測上過大評価するため（154万〜1.5億回規模の関数呼び出しがあるコードでは特に顕著）。Step 2 は I/O 削減が主効果のためこの限りではなく、実測どおり倍率に近い改善が出た。
 
-src = o3d.t.geometry.PointCloud(device).from_legacy(other_map)
-dst = o3d.t.geometry.PointCloud(device).from_legacy(front_map)
+### 次に試す予定（未実装・2026-07-04 時点）
 
-result = o3d.t.pipelines.registration.icp(
-    src, dst,
-    max_correspondence_distance=0.5,
-    estimation_method=o3d.t.pipelines.registration.TransformationEstimationPointToPlane(),
-)
-T_align = result.transformation.numpy()
-```
-
-CPU フォールバック:
-
-```python
-device = o3d.core.Device("CPU:0")  # GPU 無効時は同コードで CPU 動作
-```
-
-### CuPy による点群座標変換 (Step 2/3) の使い方
-
-```python
-try:
-    import cupy as cp
-    xp = cp          # GPU
-except ImportError:
-    import numpy as cp
-    xp = cp          # CPU フォールback (numpy と同一 API)
-
-pts = xp.asarray(points_xyz)          # (N, 3)
-T   = xp.asarray(transform_matrix)    # (4, 4)
-pts_h = xp.hstack([pts, xp.ones((len(pts), 1))])
-pts_transformed = (T @ pts_h.T).T[:, :3]
-```
+- **Step 4: スキャン間引きによる高速化（コード変更不要）**: 既存の `l2l_scan_stride`（既定 3）・`l2l_points_per_scan`（既定 3000）を `--config` で調整するだけで map_blocks 数を削減できる。
+  **注目すべき事実**: 今回のフル 503 scan 実行の rmse（right 12.5cm）は、以前 GT 照合済みの 151 scan サブセットでの結果（right 2.7cm）より**悪化**している。データを増やせば精度が上がるとは限らないため、間引いても精度が大きく落ちない可能性がある（要実測検証）。
 
 ---
 
@@ -1010,7 +996,7 @@ tools/auto-calib/
 ├── step5_v3_cam_cloud.py        # Step5 v3 part1: KLT追跡+多視点三角測量（camera cloud構築）✅ 実装・メカニズム検証済み（fix解での品質検証待ち）
 ├── step5_v3_register.py         # Step5 v3 part2: LiDARマップへ登録（reprojection GN, Step4流用）✅ 実装・メカニズム検証済み（fix解での品質検証待ち）
 ├── step6_joint_optimize.py      # 全 TF 同時精密化 (任意) ⬜ 未実装
-├── run_pipeline.py              # 全ステップ実行（Step 0 が FAIL なら即中断）⬜ 未実装
+├── run_pipeline.py              # 全ステップ実行（Step 0 が FAIL なら即中断、各Stepの所要時間を表示）✅ Step 0-4 実装済み
 └── verify_result.py             # 投影可視化・残差レポート・合否判定 ⬜ 未実装
 ```
 > Step 5 は通常・魚眼を **1ファイル `step5_cam_to_lidar.py`** に統合（当初案の `step5b_fisheye_to_lidar.py` は投影モデル分岐で吸収したため不要）。

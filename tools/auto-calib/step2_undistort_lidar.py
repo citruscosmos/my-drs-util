@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
 
@@ -118,7 +119,39 @@ def plot_lidar_diag(ldir, name, idx_list, disp_max_list, disp_mean_list, samples
     return paths
 
 
-def process_lidar(files, name, traj, drs_T_lidar, out_dir, cfg, stride, max_scans):
+def read_lidar_buffers(files, names, stride, max_scans):
+    """Single pass over the bag reading all of ``names``' topics together,
+    buffering raw (undeserialized) message bytes per lidar after applying the
+    same idx/stride/max_scans filtering ``process_lidar`` used to apply per
+    topic-read. Returns {name: [(idx, data), ...]}.
+
+    Replaces the old N-separate-full-bag-reads approach (one per lidar) with
+    one read pass, since mcap's log_time_order=True default (the reader's
+    default) already yields each topic's own messages in the same relative
+    order whether or not other topics are included in the filter.
+    """
+    topic_to_name = {common.LIDAR_TOPICS[n]: n for n in names}
+    buffers: dict[str, list] = {n: [] for n in names}
+    idx_counters = {n: -1 for n in names}
+    done = set()
+    for tp, _tns, data in common.iter_messages(files, list(topic_to_name)):
+        name = topic_to_name.get(tp)
+        if name is None or name in done:
+            continue
+        idx_counters[name] += 1
+        idx = idx_counters[name]
+        if idx % stride != 0:
+            continue
+        if max_scans is not None and len(buffers[name]) >= max_scans:
+            done.add(name)
+            if len(done) == len(names):
+                break
+            continue
+        buffers[name].append((idx, data))
+    return buffers
+
+
+def process_lidar(name, buffer, traj, drs_T_lidar, out_dir, cfg):
     from sensor_msgs.msg import PointCloud2
     from rclpy.serialization import deserialize_message
 
@@ -127,19 +160,11 @@ def process_lidar(files, name, traj, drs_T_lidar, out_dir, cfg, stride, max_scan
     os.makedirs(ldir, exist_ok=True)
     manifest = {"lidar": name, "topic": topic, "drs_T_lidar": drs_T_lidar.tolist(),
                 "undistort_enabled": bool(cfg["undistort_enabled"]), "scans": []}
-    idx = -1
     written = 0
     max_disp = 0.0
     idx_list, disp_max_list, disp_mean_list = [], [], []
     first_sample, worst_sample = None, None
-    for tp, _tns, data in common.iter_messages(files, [topic]):
-        if tp != topic:
-            continue
-        idx += 1
-        if idx % stride != 0:
-            continue
-        if max_scans is not None and written >= max_scans:
-            break
+    for idx, data in buffer:
         msg = deserialize_message(data, PointCloud2)
         disp_entry = {}
         if cfg["undistort_enabled"]:
@@ -183,21 +208,62 @@ def process_lidar(files, name, traj, drs_T_lidar, out_dir, cfg, stride, max_scan
     return written, max_disp, disp_stats, diag_paths
 
 
+def _worker_entry(name, buffer, traj, drs_T_lidar, out_dir, cfg, result_queue):
+    try:
+        written, max_disp, disp_stats, diag_paths = process_lidar(
+            name, buffer, traj, drs_T_lidar, out_dir, cfg)
+        result_queue.put((name, written, max_disp, disp_stats, diag_paths, None))
+    except Exception:
+        import traceback
+        result_queue.put((name, 0, 0.0, None, [], traceback.format_exc()))
+
+
 def _run(args, cfg):
     stride = args.stride if args.stride is not None else int(cfg["lidar_scan_stride"])
     files = common.resolve_bag_files(args.bag)
     traj = build_interpolator(args.rtk_poses)
     tf = common.load_tf_static(files)
 
-    lidars = [x.strip() for x in args.lidars.split(",") if x.strip()]
-    for name in lidars:
+    requested = [x.strip() for x in args.lidars.split(",") if x.strip()]
+    active = []
+    for name in requested:
         key = ("drs_base_link", f"lidar_{name}")
         if key not in tf:
             print(f"  [skip] {name}: {key} not in tf_static")
             continue
-        n, max_disp, disp_stats, diag_paths = process_lidar(
-            files, name, traj, tf[key], args.out_dir, cfg, stride, args.max_scans)
-        print(f"Step 2 [{name}]: wrote {n} scans, max point de-skew {max_disp*100:.1f} cm")
+        active.append((name, tf[key]))
+    if not active:
+        print(f"  output under {args.out_dir}/undistorted/")
+        return 0
+
+    names = [n for n, _ in active]
+    print(f"  reading bag in a single pass for {len(names)} lidar(s): {','.join(names)}")
+    buffers = read_lidar_buffers(files, names, stride, args.max_scans)
+    for name in names:
+        print(f"  [{name}] buffered {len(buffers[name])} scans")
+
+    # Each lidar writes to its own undistorted/<name>/ subdir, so per-lidar
+    # workers (fork: buffers are inherited copy-on-write, not pickled) never
+    # touch shared state and can run fully in parallel.
+    ctx = mp.get_context("fork")
+    result_queue = ctx.Queue()
+    procs = [ctx.Process(target=_worker_entry,
+                          args=(name, buffers[name], traj, drs_T_lidar, args.out_dir, cfg, result_queue))
+             for name, drs_T_lidar in active]
+    for p in procs:
+        p.start()
+    results = {}
+    for _ in procs:
+        name, written, max_disp, disp_stats, diag_paths, err = result_queue.get()
+        results[name] = (written, max_disp, disp_stats, diag_paths, err)
+    for p in procs:
+        p.join()
+
+    for name, _ in active:
+        written, max_disp, disp_stats, diag_paths, err = results[name]
+        if err:
+            raise RuntimeError(f"Step 2 [{name}] worker failed:\n{err}")
+        print(f"Step 2 [{name}]: wrote {written} scans, max point de-skew {max_disp*100:.1f} cm")
         if disp_stats:
             print(f"  disp percentiles [cm]: p50={disp_stats['p50_cm']} "
                   f"p95={disp_stats['p95_cm']} max={disp_stats['max_cm']}")
