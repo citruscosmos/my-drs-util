@@ -422,6 +422,10 @@ DEFAULT_CONFIG = {
     # Step 2
     "undistort_enabled": True,
     "lidar_scan_stride": 1,
+    # GPU acceleration (currently used by Step 3's visibility range-filter,
+    # the O(n_voxels x n_scans) bottleneck; auto-disables if no CUDA device).
+    "gpu_enabled": True,
+    "gpu_visibility_chunk_scans": 32,  # scans batched per GPU call (bounds VRAM use)
     # Step 3 (front map build + visibility-normalized voxel voting)
     "map_voxel_size": 0.1,
     "vote_threshold_ratio": 0.3,

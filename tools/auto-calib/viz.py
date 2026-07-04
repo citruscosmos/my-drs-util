@@ -116,7 +116,16 @@ def topdown_scatter(path, points_list, cfg=None, title="", xlabel="x [m]", ylabe
     if extra:
         extra(ax)
     if any(k.get("label") for _, k in points_list):
-        ax.legend(markerscale=10, loc="best")
+        leg = ax.legend(loc="best")
+        # Normalize legend marker sizes instead of a blanket markerscale: dense
+        # point-cloud series use tiny s (~0.15-3) that needs boosting to be
+        # visible, but annotation markers (e.g. start/end, s=80) are already
+        # large and would blow up into oversized icons that swallow the text.
+        for h in leg.legend_handles:
+            try:
+                h.set_sizes([50])
+            except (AttributeError, NotImplementedError):
+                pass
     if colorbar_label is not None and mappable is not None:
         fig.colorbar(mappable, ax=ax, label=colorbar_label, shrink=0.8)
     save_fig(fig, path, dpi=int((cfg or {}).get("viz_dpi", 110)))

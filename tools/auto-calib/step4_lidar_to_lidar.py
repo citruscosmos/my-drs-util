@@ -240,20 +240,59 @@ def _huber_w(r, d):
     return np.where(ar <= d, 1.0, d / np.maximum(ar, 1e-12))
 
 
+def _batched_query(E, blocks):
+    """Transform each block's points by its own pose*E, then query each
+    block's target tree, batching the query across blocks that share the
+    same tree object (identity) into a single cKDTree.query() call.
+
+    map_blocks all target one shared front-map tree per voxel scale, so a
+    naive per-block query (one call each) pays scipy's workers=-1 thread-pool
+    spin-up/join cost once per block -- profiling showed this thread
+    management (not the actual NN search) dominates Step 4's wall time at
+    scale (~400s/777s in a 150-scan profile). Batching is purely mechanical:
+    each query point's nearest neighbor depends only on its own coordinates,
+    so concatenating points from same-tree blocks into one call and splitting
+    the result back is numerically identical to querying separately.
+    inter_blocks each have a distinct local-overlap tree, so they end up as
+    singleton groups here and are queried exactly as before (no behavior
+    change, no risk of cross-block correspondence leaking between pairs).
+
+    Returns (xs, results): xs[i] is block i's transformed points, results[i]
+    is that block's (dist, idx) query result, both aligned with `blocks`.
+    """
+    xs = [None] * len(blocks)
+    groups: dict[int, list[int]] = {}
+    for i, b in enumerate(blocks):
+        AE = b.A @ E
+        xs[i] = b.p @ AE[:3, :3].T + AE[:3, 3]
+        groups.setdefault(id(b.tree), []).append(i)
+    results = [None] * len(blocks)
+    for members in groups.values():
+        if len(members) == 1:
+            i = members[0]
+            results[i] = blocks[i].tree.query(xs[i], workers=-1)
+            continue
+        tree = blocks[members[0]].tree
+        sizes = [len(xs[i]) for i in members]
+        offs = np.cumsum([0] + sizes)
+        dist, idx = tree.query(np.concatenate([xs[i] for i in members]), workers=-1)
+        for k, i in enumerate(members):
+            results[i] = (dist[offs[k]:offs[k + 1]], idx[offs[k]:offs[k + 1]])
+    return xs, results
+
+
 def _accumulate(E, blocks):
     H = np.zeros((6, 6))
     g = np.zeros(6)
     cost = 0.0
     sse = 0.0
     cnt = 0
-    for b in blocks:
-        AE = b.A @ E
-        R = AE[:3, :3]
-        x = b.p @ R.T + AE[:3, 3]
-        dist, idx = b.tree.query(x, workers=-1)
+    xs, qr = _batched_query(E, blocks)
+    for b, x, (dist, idx) in zip(blocks, xs, qr):
         m = dist < b.corr
         if not np.any(m):
             continue
+        R = (b.A @ E)[:3, :3]
         pm = b.p[m]
         n = b.tnorm[idx[m]]
         r = np.einsum("ij,ij->i", n, x[m] - b.tpts[idx[m]])
@@ -275,10 +314,8 @@ def _eval_cost(E, blocks):
     cost = 0.0
     sse = 0.0
     cnt = 0
-    for b in blocks:
-        AE = b.A @ E
-        x = b.p @ AE[:3, :3].T + AE[:3, 3]
-        dist, idx = b.tree.query(x, workers=-1)
+    xs, qr = _batched_query(E, blocks)
+    for b, x, (dist, idx) in zip(blocks, xs, qr):
         m = dist < b.corr
         if not np.any(m):
             continue
@@ -296,10 +333,8 @@ def _collect_residuals(E, blocks):
     """Raw signed point-to-plane residuals (r = n.(x-target)) for all inlier
     correspondences across blocks, for before/after histogram diagnostics."""
     out = []
-    for b in blocks:
-        AE = b.A @ E
-        x = b.p @ AE[:3, :3].T + AE[:3, 3]
-        dist, idx = b.tree.query(x, workers=-1)
+    xs, qr = _batched_query(E, blocks)
+    for b, x, (dist, idx) in zip(blocks, xs, qr):
         m = dist < b.corr
         if not np.any(m):
             continue

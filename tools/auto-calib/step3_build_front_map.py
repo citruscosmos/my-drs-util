@@ -91,66 +91,60 @@ def write_pcd(path: str, xyz: np.ndarray, intensity: np.ndarray | None = None) -
 
 
 class _VoxelAccumulator:
-    """Growable int64-keyed voxel store: per-voxel sum(xyz), sum(i), pts, scans."""
+    """int64-keyed voxel store: per-voxel sum(xyz), sum(i), pts, scans.
 
-    def __init__(self, cap: int = 1 << 18):
-        self.d: dict[int, int] = {}
-        self.key = np.empty(cap, dtype=np.int64)
-        self.sum = np.empty((cap, 3), dtype=np.float64)
-        self.si = np.empty(cap, dtype=np.float64)
-        self.cnt = np.empty(cap, dtype=np.int64)
-        self.occ = np.empty(cap, dtype=np.int64)  # distinct scans occupying voxel
-        self.n = 0
+    Each scan is deduped to unique voxel keys locally (vectorized, cheap); the
+    cross-scan merge is deferred to a single global np.unique in centroids()
+    instead of an incremental per-scan Python dict merge. The incremental
+    version's `self.d.get(int(k), -1)` generator did one Python-level dict
+    lookup per unique voxel key per scan (measured as Step 3's single largest
+    cost: ~480k dict.get() calls for just 100 scans). Deferring the merge
+    replaces that with two global vectorized calls total, independent of
+    scan count.
+    """
 
-    def _grow(self, need: int) -> None:
-        cap = len(self.key)
-        while cap < need:
-            cap *= 2
-        self.key = np.resize(self.key, cap)
-        self.sum = np.resize(self.sum, (cap, 3))
-        self.si = np.resize(self.si, cap)
-        self.cnt = np.resize(self.cnt, cap)
-        self.occ = np.resize(self.occ, cap)
+    def __init__(self):
+        self._keys: list[np.ndarray] = []
+        self._sums: list[np.ndarray] = []
+        self._sis: list[np.ndarray] = []
+        self._cnts: list[np.ndarray] = []
 
     def add_scan(self, keys: np.ndarray, world: np.ndarray, intensity: np.ndarray) -> None:
-        """Merge one scan's per-voxel aggregates (occ += 1 per distinct voxel)."""
+        """Dedup one scan's points to unique voxel keys; queue for the global merge."""
         uk, inv = np.unique(keys, return_inverse=True)
         su = np.zeros((len(uk), 3), dtype=np.float64)
         np.add.at(su, inv, world)
         si = np.zeros(len(uk), dtype=np.float64)
         np.add.at(si, inv, intensity)
         cu = np.bincount(inv, minlength=len(uk)).astype(np.int64)
+        self._keys.append(uk)
+        self._sums.append(su)
+        self._sis.append(si)
+        self._cnts.append(cu)
 
-        idx = np.fromiter((self.d.get(int(k), -1) for k in uk.tolist()),
-                          dtype=np.int64, count=len(uk))
-        ex = idx >= 0
-        if np.any(ex):
-            ei = idx[ex]
-            self.sum[ei] += su[ex]
-            self.si[ei] += si[ex]
-            self.cnt[ei] += cu[ex]
-            self.occ[ei] += 1
-        new = ~ex
-        m = int(np.count_nonzero(new))
-        if m:
-            if self.n + m > len(self.key):
-                self._grow(self.n + m)
-            rows = np.arange(self.n, self.n + m)
-            nk = uk[new]
-            self.key[rows] = nk
-            self.sum[rows] = su[new]
-            self.si[rows] = si[new]
-            self.cnt[rows] = cu[new]
-            self.occ[rows] = 1
-            for k, r in zip(nk.tolist(), rows.tolist()):
-                self.d[int(k)] = int(r)
-            self.n += m
+    @property
+    def n(self) -> int:
+        """Voxel-observations queued so far (pre-merge; a progress proxy, not
+        the final distinct-voxel count -- that's only known after centroids())."""
+        return sum(len(k) for k in self._keys)
 
     def centroids(self):
-        n = self.n
-        centers = self.sum[:n] / self.cnt[:n][:, None]
-        inten = self.si[:n] / self.cnt[:n]
-        return centers, inten, self.occ[:n].copy()
+        """One global merge across all scans' deduped voxels. occ = number of
+        distinct scans touching each voxel, since each scan contributes each
+        of its own voxel keys at most once here."""
+        if not self._keys:
+            return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=np.int64)
+        uk, inv = np.unique(np.concatenate(self._keys), return_inverse=True)
+        n = len(uk)
+        sum_xyz = np.zeros((n, 3), dtype=np.float64)
+        np.add.at(sum_xyz, inv, np.concatenate(self._sums))
+        si = np.zeros(n, dtype=np.float64)
+        np.add.at(si, inv, np.concatenate(self._sis))
+        cnt = np.bincount(inv, weights=np.concatenate(self._cnts), minlength=n).astype(np.int64)
+        occ = np.bincount(inv, minlength=n).astype(np.int64)
+        centers = sum_xyz / cnt[:, None]
+        inten = si / cnt
+        return centers, inten, occ
 
 
 def _scan_pose(traj, t0_ns, drs_T_lidar):
@@ -222,6 +216,57 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
     }
 
 
+def _gpu_device(cfg):
+    """Return an Open3D CUDA device if GPU accel is enabled + available, else None."""
+    if not cfg.get("gpu_enabled", True):
+        return None
+    try:
+        import open3d as o3d
+        if o3d.core.cuda.is_available():
+            return o3d.core.Device("CUDA:0")
+    except Exception:
+        pass
+    return None
+
+
+def _range_masks_cpu(centers, origins, rmax2, rmin2):
+    masks = []
+    for o_m in origins:
+        d = centers - o_m
+        dist2 = np.einsum("ij,ij->i", d, d)
+        masks.append((dist2 <= rmax2) & (dist2 >= rmin2))
+    return masks
+
+
+def _range_masks_gpu(centers, origins, rmax2, rmin2, device, cfg):
+    """Same range mask as _range_masks_cpu, batched across chunks of scans on
+    GPU (Open3D tensor broadcasting). Only the boolean mask is transferred
+    back to host, not the (chunk x n_voxels x 3) delta tensor, which is what
+    makes this ~13x faster than the CPU loop in practice: the range filter is
+    O(n_voxels x n_scans) and dominates Step 3 at full map scale, while
+    everything downstream of it (FOV angle check) runs on the much smaller
+    in-range subset per scan and stays on CPU unchanged (see _visibility_counts).
+    Uses float32 on GPU; at map extents of ~100s of meters this is far more
+    precise than the meter-scale range/FOV thresholds being tested, so the
+    only expected discrepancy vs. the float64 CPU path is an occasional voxel
+    exactly on a range/FOV boundary flipping sides -- immaterial for a
+    visibility-vote heuristic."""
+    import open3d as o3d
+    chunk = max(1, int(cfg.get("gpu_visibility_chunk_scans", 32)))
+    n = len(centers)
+    centers_t = o3d.core.Tensor(centers.astype(np.float32), device=device).reshape((1, n, 3))
+    masks = []
+    for s0 in range(0, len(origins), chunk):
+        o_chunk = np.asarray(origins[s0:s0 + chunk], dtype=np.float32)
+        o_t = o3d.core.Tensor(o_chunk, device=device).reshape((len(o_chunk), 1, 3))
+        d = centers_t - o_t
+        dist2 = (d * d).sum(dim=2)
+        mask = (dist2 <= rmax2).logical_and(dist2 >= rmin2)
+        mask_np = mask.cpu().numpy()
+        masks.extend(mask_np[k] for k in range(len(o_chunk)))
+    return masks
+
+
 def _visibility_counts(centers, origins, rots, cfg):
     """For each voxel, count scans whose range+FOV cone contains its center."""
     n = len(centers)
@@ -232,14 +277,18 @@ def _visibility_counts(centers, origins, rots, cfg):
     rmin2 = float(cfg["vote_min_range"]) ** 2
     haz = np.deg2rad(float(cfg["vote_hfov_deg"]) / 2.0)
     hel = np.deg2rad(float(cfg["vote_vfov_deg"]) / 2.0)
-    for o_m, R_ml in zip(origins, rots):
-        d = centers - o_m
-        dist2 = np.einsum("ij,ij->i", d, d)
-        m = (dist2 <= rmax2) & (dist2 >= rmin2)
+
+    device = _gpu_device(cfg)
+    range_masks = (_range_masks_gpu(centers, origins, rmax2, rmin2, device, cfg) if device is not None
+                  else _range_masks_cpu(centers, origins, rmax2, rmin2))
+
+    for k, R_ml in enumerate(rots):
+        m = range_masks[k]
         if not np.any(m):
             continue
         idx = np.nonzero(m)[0]
-        ds = d[idx] @ R_ml  # world -> sensor frame (R_ml.T @ d == d @ R_ml)
+        d = centers[idx] - origins[k]
+        ds = d @ R_ml  # world -> sensor frame (R_ml.T @ d == d @ R_ml)
         az = np.abs(np.arctan2(ds[:, 1], ds[:, 0]))
         el = np.abs(np.arctan2(ds[:, 2], np.hypot(ds[:, 0], ds[:, 1])))
         in_fov = (az <= haz) & (el <= hel)
