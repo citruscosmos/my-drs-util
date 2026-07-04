@@ -106,6 +106,7 @@ class _VoxelAccumulator:
     def __init__(self):
         self._keys: list[np.ndarray] = []
         self._sums: list[np.ndarray] = []
+        self._sqs: list[np.ndarray] = []
         self._sis: list[np.ndarray] = []
         self._cnts: list[np.ndarray] = []
 
@@ -114,11 +115,14 @@ class _VoxelAccumulator:
         uk, inv = np.unique(keys, return_inverse=True)
         su = np.zeros((len(uk), 3), dtype=np.float64)
         np.add.at(su, inv, world)
+        sq = np.zeros((len(uk), 3), dtype=np.float64)
+        np.add.at(sq, inv, world ** 2)
         si = np.zeros(len(uk), dtype=np.float64)
         np.add.at(si, inv, intensity)
         cu = np.bincount(inv, minlength=len(uk)).astype(np.int64)
         self._keys.append(uk)
         self._sums.append(su)
+        self._sqs.append(sq)
         self._sis.append(si)
         self._cnts.append(cu)
 
@@ -131,20 +135,32 @@ class _VoxelAccumulator:
     def centroids(self):
         """One global merge across all scans' deduped voxels. occ = number of
         distinct scans touching each voxel, since each scan contributes each
-        of its own voxel keys at most once here."""
+        of its own voxel keys at most once here. spread = RMS radial spread
+        of the raw points around their voxel centroid (sqrt of the trace of
+        the per-voxel point covariance, using all constituent points across
+        all scans, not just per-scan means) -- a direct, cheap (one extra
+        sum-of-squares accumulator) measure of front-map "smear": how far the
+        observations that got averaged into a centroid actually disagreed
+        with each other. Voxels with cnt<2 have spread=0 (undefined, single
+        observation trivially matches its own mean) -- filter those out when
+        interpreting the spread distribution."""
         if not self._keys:
-            return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=np.int64)
+            return np.zeros((0, 3)), np.zeros(0), np.zeros(0, dtype=np.int64), np.zeros(0)
         uk, inv = np.unique(np.concatenate(self._keys), return_inverse=True)
         n = len(uk)
         sum_xyz = np.zeros((n, 3), dtype=np.float64)
         np.add.at(sum_xyz, inv, np.concatenate(self._sums))
+        sum_xyz2 = np.zeros((n, 3), dtype=np.float64)
+        np.add.at(sum_xyz2, inv, np.concatenate(self._sqs))
         si = np.zeros(n, dtype=np.float64)
         np.add.at(si, inv, np.concatenate(self._sis))
         cnt = np.bincount(inv, weights=np.concatenate(self._cnts), minlength=n).astype(np.int64)
         occ = np.bincount(inv, minlength=n).astype(np.int64)
         centers = sum_xyz / cnt[:, None]
         inten = si / cnt
-        return centers, inten, occ
+        var_xyz = np.maximum(sum_xyz2 / cnt[:, None] - centers ** 2, 0.0)
+        spread = np.sqrt(var_xyz.sum(axis=1))
+        return centers, inten, occ, spread
 
 
 def _scan_pose(traj, t0_ns, drs_T_lidar):
@@ -201,11 +217,16 @@ def _range_image(xyz, haz, hel, footprint_m):
     return uk, minr
 
 
-def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verbose=True):
+def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verbose=True,
+                    scan_filter=None):
     """Accumulate one LiDAR's undistorted scans into a visibility-voted voxel map.
 
+    scan_filter: optional callable(scan_index, scan_dict, t0_ns) -> bool, applied
+    after the map_scan_stride/max_scans selection, to restrict which scans are
+    accumulated (e.g. isolating turning vs. straight segments for smear analysis).
+
     Returns a dict with the surviving voxel centroids and the diagnostic
-    occupancy/visibility arrays for every raw voxel.
+    occupancy/visibility/spread arrays for every raw voxel.
     """
     voxel = float(cfg["map_voxel_size"])
     stride = int(cfg["map_scan_stride"])
@@ -227,6 +248,8 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
             continue
         if max_scans is not None and used >= max_scans:
             break
+        if scan_filter is not None and not scan_filter(i, s, s["t0_ns"]):
+            continue
         pts = np.load(os.path.join(scan_dir, s["file"]))
         if len(pts) == 0:
             continue
@@ -245,7 +268,7 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
         if verbose and used % 100 == 0:
             print(f"  [{lidar}] accumulated {used} scans, {acc.n} voxels")
 
-    centers, inten, occ = acc.centroids()
+    centers, inten, occ, spread = acc.centroids()
     origins = np.asarray(origins, dtype=np.float64)
     rots = np.asarray(rots, dtype=np.float64)
 
@@ -262,6 +285,7 @@ def build_voxel_map(out_dir, traj, lidar, drs_T_lidar, cfg, max_scans=None, verb
         "visible": visible,
         "ratio": ratio,
         "keep": keep,
+        "spread": spread,
         "n_scans": used,
         "voxel_size": voxel,
     }
@@ -372,12 +396,15 @@ def _visibility_counts(centers, origins, rots, cfg, range_grids=None, footprint_
 
 
 def plot_map(result, out_dir, lidar, cfg):
-    """Top-down kept-map (colored by height), vote-ratio histogram, and a
+    """Top-down kept-map (colored by height), vote-ratio histogram, a
     kept-vs-removed overlay to visually judge whether the vote filter is
-    deleting real static structure vs. actual transient clutter."""
+    deleting real static structure vs. actual transient clutter, and a
+    voxel-spread ("smear") histogram + topdown map."""
     keep = result["keep"]
     centers = result["centers"]
     ratio = result["ratio"]
+    occ = result["occ"]
+    spread = result["spread"]
     threshold = float(cfg["vote_threshold_ratio"])
     ps = float(cfg["viz_point_size"])
     pa = float(cfg["viz_point_alpha"])
@@ -400,6 +427,20 @@ def plot_map(result, out_dir, lidar, cfg):
         [(kept_xy, {"c": "lightgray", "s": ps, "alpha": pa, "label": "kept"}),
          (removed_xy, {"c": "red", "s": ps, "alpha": pa, "label": "removed (vote filter)"})],
         cfg, title=f"Step 3 [{lidar}]: kept vs. removed voxels"))
+    # Spread ("smear") is only meaningful for voxels with >=2 contributing
+    # points; single-observation voxels trivially have spread=0.
+    multi = keep & (occ >= 2)
+    if np.any(multi):
+        paths.append(viz.hist_plot(
+            os.path.join(out_dir, f"step3_{lidar}_spread_hist.png"), spread[multi], cfg, bins=40,
+            title=f"Step 3 [{lidar}]: kept-voxel spread (smear) distribution [m]",
+            xlabel="RMS radial spread [m]"))
+        paths.append(viz.topdown_scatter(
+            os.path.join(out_dir, f"step3_{lidar}_spread_topdown.png"),
+            [(centers[multi][:, :2], {"c": spread[multi], "cmap": "turbo", "s": ps, "alpha": pa,
+                                      "vmax": np.percentile(spread[multi], 95)})],
+            cfg, title=f"Step 3 [{lidar}]: kept-voxel spread (smear), colored [m]",
+            colorbar_label="RMS radial spread [m]"))
     return paths
 
 
@@ -456,8 +497,6 @@ def _run(args, cfg):
         meta["bbox_min"] = lo.tolist()
         meta["bbox_max"] = hi.tolist()
         meta["footprint_xy_m"] = [float(hi[0] - lo[0]), float(hi[1] - lo[1])]
-    with open(os.path.join(args.out_dir, f"{args.lidar}_lidar_map_meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
 
     removed = n_raw - n_keep
     print(f"Step 3 [{args.lidar}]: {result['n_scans']} scans -> "
@@ -470,6 +509,17 @@ def _run(args, cfg):
         r = result["ratio"]
         print(f"  vote ratio percentiles: p10={np.percentile(r,10):.2f} "
               f"p50={np.percentile(r,50):.2f} p90={np.percentile(r,90):.2f}")
+    multi = keep & (result["occ"] >= 2) if n_keep else np.zeros(0, dtype=bool)
+    if np.any(multi):
+        sp = result["spread"][multi]
+        sp_cm = sp * 100.0
+        meta["spread_cm_p10_p50_p90"] = [float(np.percentile(sp_cm, q)) for q in (10, 50, 90)]
+        print(f"  kept-voxel spread (smear) [cm], occ>=2 (n={multi.sum()}): "
+              f"p10={np.percentile(sp_cm,10):.2f} p50={np.percentile(sp_cm,50):.2f} "
+              f"p90={np.percentile(sp_cm,90):.2f}")
+
+    with open(os.path.join(args.out_dir, f"{args.lidar}_lidar_map_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
     if n_keep and cfg["viz_enabled"] and not args.no_viz:
         for p in plot_map(result, args.out_dir, args.lidar, cfg):
