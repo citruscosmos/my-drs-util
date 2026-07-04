@@ -492,6 +492,26 @@ def aligned_world_xy(scans, E, cap_scans):
     return np.concatenate(world_pts)[:, :2] if world_pts else np.zeros((0, 2))
 
 
+def overlay_gap_stats(front_tree_xy, world_xy):
+    """Numeric counterpart to the visual overlay plots: 2D nearest-neighbor
+    distance from each aligned point (the same population plotted in
+    step4_{name}_overlay_topdown.png) to the front map, in cm. Unlike the
+    solver's own reported rmse (point-to-plane, Huber-weighted, computed on
+    the solver's own scan/point subsample), this is a plain unweighted
+    point-to-point gap on the exact points the overlay renders -- a direct
+    "does the overlay actually line up" number rather than an optimization
+    diagnostic."""
+    if len(world_xy) == 0:
+        return None
+    dist_cm = front_tree_xy.query(world_xy)[0] * 100.0
+    return {
+        "p50": float(np.percentile(dist_cm, 50)),
+        "p90": float(np.percentile(dist_cm, 90)),
+        "p99": float(np.percentile(dist_cm, 99)),
+        "max": float(dist_cm.max()),
+    }
+
+
 def _bbox_crop(xy_list, margin_m=5.0):
     """Bounding box (with margin) of the union of xy_list, or None if empty.
 
@@ -514,13 +534,39 @@ def _crop_xy(xy, bbox):
     return xy[m]
 
 
-def plot_combined_overlay(out_dir, front_pts_xy, lidar_xy, cfg):
+def _gap_text(gap, prefix=""):
+    if not gap:
+        return ""
+    return (f"{prefix}overlay gap [cm]: p50={gap['p50']:.1f} p90={gap['p90']:.1f} "
+            f"p99={gap['p99']:.1f} max={gap['max']:.1f}")
+
+
+def _add_corner_text(ax, text):
+    if text:
+        ax.text(0.02, 0.02, text, transform=ax.transAxes, fontsize=8,
+                va="bottom", ha="left", family="monospace",
+                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=3))
+
+
+def _combine_extra(*fns):
+    fns = [f for f in fns if f]
+    if not fns:
+        return None
+
+    def _run(ax):
+        for f in fns:
+            f(ax)
+    return _run
+
+
+def plot_combined_overlay(out_dir, front_pts_xy, lidar_xy, cfg, gaps=None):
     """All-lidar-at-once overlay: front map + every other lidar's aligned
     points in one figure, one color per lidar. The per-lidar overlay plots
     only ever show one lidar against the front map at a time; this is the
     single-glance check that all extrinsics agree on the same structure
     simultaneously (e.g. a wall or curb that right/left/rear all cross).
-    Cropped to the aligned points' bounding box (see _bbox_crop)."""
+    Cropped to the aligned points' bounding box (see _bbox_crop). gaps (optional
+    {name: overlay_gap_stats() dict}) is annotated as text, one line per lidar."""
     ps, pa = float(cfg["viz_point_size"]), float(cfg["viz_point_alpha"])
     bbox = _bbox_crop(list(lidar_xy.values()))
     colors = {"right": "tab:blue", "left": "tab:green", "rear": "tab:red"}
@@ -529,16 +575,22 @@ def plot_combined_overlay(out_dir, front_pts_xy, lidar_xy, cfg):
         if len(xy):
             series.append((xy, {"c": colors.get(name, "black"), "s": ps, "alpha": pa,
                                 "label": f"{name} (aligned)"}))
-    extra = (lambda ax, b=bbox: (ax.set_xlim(b[0], b[1]), ax.set_ylim(b[2], b[3]))) if bbox else None
+    bbox_extra = (lambda ax, b=bbox: (ax.set_xlim(b[0], b[1]), ax.set_ylim(b[2], b[3]))) if bbox else None
+    text = "\n".join(_gap_text(gaps[n], prefix=f"{n}: ") for n in lidar_xy if gaps and gaps.get(n))
+    text_extra = (lambda ax, t=text: _add_corner_text(ax, t)) if text else None
+    extra = _combine_extra(bbox_extra, text_extra)
     return viz.topdown_scatter(
         os.path.join(out_dir, "step4_combined_overlay_topdown.png"), series, cfg,
         title="Step 4: all-lidar aligned overlay onto front map", extra=extra)
 
 
-def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts_xy, cfg):
+def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts_xy, cfg, world_xy, gap=None):
     """Convergence curve, before/after residual histogram, aligned-overlay onto
     the front map, and per-axis translation curvature — visual/quantitative
-    sanity checks beyond the summary line printed by _record()."""
+    sanity checks beyond the summary line printed by _record(). world_xy is the
+    precomputed aligned_world_xy() output (shared with the overlay-gap stat in
+    _run() so both use the exact same point population); gap is that stat's
+    result, annotated as text on the overlay plot."""
     paths = []
     hist = res["history"]
     if hist:
@@ -572,12 +624,12 @@ def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts
             title=f"Step 4 [{name}]: point-to-plane residuals (init tf_static vs. final)",
             xlabel="signed residual [cm]", labels=("init", "final")))
 
-    cap_scans = int(cfg.get("viz_max_scans_overlay", 60))
-    world_xy = aligned_world_xy(scans, res["E"], cap_scans)
     if len(world_xy):
         ps, pa = float(cfg["viz_point_size"]), float(cfg["viz_point_alpha"])
         bbox = _bbox_crop([world_xy])
-        extra = (lambda ax, b=bbox: (ax.set_xlim(b[0], b[1]), ax.set_ylim(b[2], b[3]))) if bbox else None
+        bbox_extra = (lambda ax, b=bbox: (ax.set_xlim(b[0], b[1]), ax.set_ylim(b[2], b[3]))) if bbox else None
+        text_extra = (lambda ax, t=_gap_text(gap): _add_corner_text(ax, t)) if gap else None
+        extra = _combine_extra(bbox_extra, text_extra)
         paths.append(viz.topdown_scatter(
             os.path.join(out_dir, f"step4_{name}_overlay_topdown.png"),
             [(_crop_xy(front_pts_xy, bbox), {"c": "lightgray", "s": ps, "alpha": pa, "label": "front map"}),
@@ -589,7 +641,7 @@ def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts
         os.path.join(out_dir, f"step4_{name}_axis_curv.png"), ["x", "y", "z"], [cx, cy, cz],
         cfg, title=f"Step 4 [{name}]: translation-axis Hessian curvature (low = weakly observable)",
         ylabel="curvature", log_y=True))
-    return paths, world_xy
+    return paths
 
 
 def _run(args, cfg):
@@ -605,6 +657,9 @@ def _run(args, cfg):
     front_pts = load_front_map_pts(args.out_dir)
     print(f"Step 4: front map {len(front_pts)} pts; building {len(voxels)} scale targets")
     map_targets = {v: build_target(front_pts, v, v * nrad) for v in voxels}
+    from scipy.spatial import cKDTree
+    front_tree_xy = cKDTree(front_pts[:, :2])
+    cap_scans = int(cfg.get("viz_max_scans_overlay", 60))
     E_front = override.get(
         "lidar_front",
         np.asarray(step3.load_scan_manifest(args.out_dir, "front")["drs_T_lidar"], float))
@@ -613,6 +668,7 @@ def _run(args, cfg):
 
     results, yaml_tf, E = {}, {}, {}
     lidar_xy = {}  # name -> aligned world XY, accumulated for the combined overlay
+    gaps = {}  # name -> overlay_gap_stats() dict, accumulated for the combined overlay
     # Stage 1: right, left (each anchored to fixed front via front-* term A)
     for name in ("right", "left"):
         scans, E0 = load_lidar_scans(args.out_dir, name, traj, cfg, args.max_scans)
@@ -622,9 +678,16 @@ def _run(args, cfg):
         res = optimize(E0, map_targets, scans, geoms, cfg, tag=name)
         E[name] = res["E"]
         _record(results, yaml_tf, name, res["E"], E0, res, len(scans), len(geoms))
+        lidar_xy[name] = aligned_world_xy(scans, res["E"], cap_scans)
+        gaps[name] = overlay_gap_stats(front_tree_xy, lidar_xy[name])
+        if gaps[name]:
+            gap = gaps[name]
+            results[name]["overlay_gap_cm"] = gap
+            print(f"  [{name}] overlay gap vs front map [cm]: p50={gap['p50']:.2f} "
+                  f"p90={gap['p90']:.2f} p99={gap['p99']:.2f} max={gap['max']:.2f}")
         if cfg["viz_enabled"] and not args.no_viz:
-            paths, lidar_xy[name] = plot_lidar_diag(args.out_dir, name, res, E0, map_targets, scans, geoms,
-                                                     front_pts[:, :2], cfg)
+            paths = plot_lidar_diag(args.out_dir, name, res, E0, map_targets, scans, geoms,
+                                    front_pts[:, :2], cfg, lidar_xy[name], gaps[name])
             for p in paths:
                 print(f"  wrote {p}")
 
@@ -638,12 +701,19 @@ def _run(args, cfg):
     print(f"[rear] {len(scans)} map-scans, {len(geoms)} rear-(right/left) overlap pairs")
     res = optimize(E0, map_targets, scans, geoms, cfg, tag="rear")
     _record(results, yaml_tf, "rear", res["E"], E0, res, len(scans), len(geoms))
+    lidar_xy["rear"] = aligned_world_xy(scans, res["E"], cap_scans)
+    gaps["rear"] = overlay_gap_stats(front_tree_xy, lidar_xy["rear"])
+    if gaps["rear"]:
+        gap = gaps["rear"]
+        results["rear"]["overlay_gap_cm"] = gap
+        print(f"  [rear] overlay gap vs front map [cm]: p50={gap['p50']:.2f} "
+              f"p90={gap['p90']:.2f} p99={gap['p99']:.2f} max={gap['max']:.2f}")
     if cfg["viz_enabled"] and not args.no_viz:
-        paths, lidar_xy["rear"] = plot_lidar_diag(args.out_dir, "rear", res, E0, map_targets, scans, geoms,
-                                                   front_pts[:, :2], cfg)
+        paths = plot_lidar_diag(args.out_dir, "rear", res, E0, map_targets, scans, geoms,
+                                front_pts[:, :2], cfg, lidar_xy["rear"], gaps["rear"])
         for p in paths:
             print(f"  wrote {p}")
-        p = plot_combined_overlay(args.out_dir, front_pts[:, :2], lidar_xy, cfg)
+        p = plot_combined_overlay(args.out_dir, front_pts[:, :2], lidar_xy, cfg, gaps)
         print(f"  wrote {p}")
 
     with open(os.path.join(args.out_dir, "lidar_to_lidar_result.json"), "w") as f:

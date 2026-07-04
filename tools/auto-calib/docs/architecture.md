@@ -1130,6 +1130,26 @@ Step 4 の点対平面 ICP は、front map 側の法線を `build_target()`（`e
 
 **示唆**: この結論が正しければ、rmse 自体をさらに下げるには front map 側の改善（スミア対策等）ではなく、(a) 法線推定半径を小さくする（テクスチャの影響を減らせるが、対応点の安定性とのトレードオフ）、(b) 点対平面ではなく点対点や別のロバスト対応方式を検討する、(c) そもそも rmse 10cm 前後を「この環境・このセンサー幾何では妥当な下限」として受け入れる、のいずれかが選択肢になる。いずれも未着手。
 
+**方針決定（2026-07-04）**: (c) を採用し、rmse 10cm 前後をこの環境・センサー幾何での妥当な下限として受け入れる。front map 側の追加改善（法線半径縮小・点対点方式への変更等）はこれ以上追求しない。
+
+### Step 4 結果妥当性の数値化: `overlay_gap_stats`（2026-07-04・パイプラインに統合済み）
+
+Step 4 の結果は従来、`step4_{name}_overlay_topdown.png`（各 lidar 単独）と `step4_combined_overlay_topdown.png`（全 lidar 同時）という**目視のオーバーレイ画像**でのみ妥当性を確認していた。既存の `rmse`（`lidar_to_lidar_result.json`）はソルバー自身の Huber 重み付き点対平面残差で、ソルバーが使った対応点のサブサンプル上での値であり、オーバーレイ画像が実際に描画している点群そのものに対する指標ではない。
+
+`step4_lidar_to_lidar.py` に `overlay_gap_stats(front_tree_xy, world_xy)` を追加した: オーバーレイ画像と**全く同じ点群**（`aligned_world_xy()` の出力）に対し、front map への生の 2D 最近傍距離を計算し、p50/p90/p99/max [cm] を返す。`_run()` 内で right/left/rear それぞれについて常時（`--no-viz` でも）計算され、`lidar_to_lidar_result.json` の各 lidar に `overlay_gap_cm` として保存される。**Step 4 はパイプライン（`run_pipeline.py`）から通常呼ばれる標準の処理なので、この数値化は既に本番パイプラインに統合済み。**
+
+さらに、この統計を `step4_{name}_overlay_topdown.png`（該当 lidar 分のみ）と `step4_combined_overlay_topdown.png`（right/left/rear 全て）の左下に直接テキスト表示するようにした（`_gap_text()`/`_add_corner_text()`/`_combine_extra()`）。
+
+**実測結果（front map 修正後、フル 503 scans）**:
+
+| lidar | rmse | gap p50 | gap p90 | gap p99 | gap max |
+|---|---|---|---|---|---|
+| right | 10.48cm (not-conv) | 4.74cm | 45.54cm | 165.57cm | 288.61cm |
+| left | 12.29cm (converged) | 5.12cm | 31.25cm | 132.46cm | 300.46cm |
+| rear | 11.58cm (not-conv) | 4.12cm | 31.36cm | 107.80cm | 619.88cm |
+
+中央値（p50）は 4〜5cm と rmse より引き締まっており、大半の点は良く整列している。ただし p90 で 31〜46cm、p99 で 108〜166cm、max は最大 620cm まで裾が伸びており、少数だが明確にズレている点が残っていることが分かる（オーバーレイ画像で目視される散在した外れ点に対応すると考えられる）。この裾の一部は、front map がカバーしていない領域（他 LiDAR の FOV 境界付近等）への最近傍探索によるもので、必ずしも較正誤差とは限らない点に注意が必要（今後の検証課題）。
+
 ---
 
 ## 実装ファイル構成
