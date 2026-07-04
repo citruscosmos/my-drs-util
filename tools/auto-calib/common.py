@@ -450,8 +450,11 @@ DEFAULT_CONFIG = {
     "icp_huber_scale": 1.0,            # Huber delta = voxel * this (robust weighting)
     "icp_degeneracy_rel": 1.0e-4,      # project out Hessian dirs below eig_max*this
     "icp_method": "point_to_plane",
-    "l2l_scan_stride": 3,              # other-lidar scan subsampling
-    "l2l_points_per_scan": 3000,       # random subsample per scan
+    "l2l_scan_stride": 12,             # other-lidar scan subsampling (2026-07-04: raised
+                                       # 3->12 after verifying near-zero rmse impact at full
+                                       # scale on the reference bag; ~4x fewer map/inter blocks)
+    "l2l_points_per_scan": 1000,       # random subsample per scan (2026-07-04: 3000->1000,
+                                       # same verification; still ample given ~120k pts/scan)
     "l2l_max_range": 60.0,             # crop other-scan points beyond this [m]
     "l2l_normal_radius_scale": 3.0,    # front-map normal radius = voxel * this
     # Step 4 term A (inter-lidar near-simultaneous overlap)
