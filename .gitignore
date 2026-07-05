@@ -39,3 +39,4 @@ Thumbs.db
 # Output directories (extracted images, point clouds, projections)
 output/
 proj_output/
+tools/auto-calib/docs/previous-method-result/

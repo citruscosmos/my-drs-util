@@ -386,6 +386,33 @@ def _combine_cost(E, map_blocks, inter_blocks, w_map, w_int):
     return cost, nm + ni
 
 
+def evaluate_only(E0, map_targets, other_scans, inter_geoms, cfg):
+    """Score a fixed extrinsic E0 (e.g. a previous calibration's tf) against the
+    front map + inter-lidar overlap, WITHOUT running the LM optimization loop.
+
+    Same term-B/term-A cost and same finest voxel scale as optimize()'s last
+    stage, so rmse/overlay-gap numbers are directly comparable to an
+    optimize()-produced result. Returns the same dict shape as optimize() (with
+    E == E0, converged=True, empty history) so _record()/plot_lidar_diag() need
+    no special-casing beyond the eval-only cosmetics they already gate on.
+    """
+    voxel_f = list(cfg["icp_multiscale_voxels"])[-1]
+    corr = min(voxel_f * float(cfg["icp_corr_dist_scale"]), float(cfg["icp_max_correspondence_dist"]))
+    huber = voxel_f * float(cfg["icp_huber_scale"])
+    w_map = float(cfg["l2l_map_weight"])
+    w_int = float(cfg["l2l_interlidar_weight"])
+    sp, sn, tree = map_targets[voxel_f]
+    map_blocks = [Block(p, M, sp, sn, tree, corr, huber, 1.0) for p, M, _t in other_scans]
+    inter_blocks = [Block(pb, np.eye(4), rp, rn, tr, corr, huber, 1.0)
+                    for (pb, rp, rn, tr) in inter_geoms]
+    H, _g, _cost, rmse, (n_map, n_int) = _combine(E0, map_blocks, inter_blocks, w_map, w_int)
+    return {
+        "E": E0.copy(), "rmse": rmse, "inliers": n_map + n_int, "converged": True,
+        "min_eig": float(np.linalg.eigh(H)[0].min()), "n_degenerate": 0,
+        "axis_curv_trans": np.diag(H)[3:6].tolist(), "history": [],
+    }
+
+
 def optimize(E0, map_targets, other_scans, inter_geoms, cfg, verbose=True, tag=""):
     """Coarse-to-fine robust LM over term B (map) + term A (inter), normalized."""
     E = E0.copy()
@@ -559,14 +586,19 @@ def _combine_extra(*fns):
     return _run
 
 
-def plot_combined_overlay(out_dir, front_pts_xy, lidar_xy, cfg, gaps=None):
+def plot_combined_overlay(out_dir, front_pts_xy, lidar_xy, cfg, gaps=None, eval_only=False):
     """All-lidar-at-once overlay: front map + every other lidar's aligned
     points in one figure, one color per lidar. The per-lidar overlay plots
     only ever show one lidar against the front map at a time; this is the
     single-glance check that all extrinsics agree on the same structure
     simultaneously (e.g. a wall or curb that right/left/rear all cross).
     Cropped to the aligned points' bounding box (see _bbox_crop). gaps (optional
-    {name: overlay_gap_stats() dict}) is annotated as text, one line per lidar."""
+    {name: overlay_gap_stats() dict}) is annotated as text, one line per lidar.
+
+    eval_only=True tags the filename/title as an evaluate_only() (fixed given
+    tf, not optimized) result, matching plot_lidar_diag's per-lidar tagging."""
+    tag = "step4_eval" if eval_only else "step4"
+    suffix = " (eval: given tf, not optimized)" if eval_only else ""
     ps, pa = float(cfg["viz_point_size"]), float(cfg["viz_point_alpha"])
     bbox = _bbox_crop(list(lidar_xy.values()))
     colors = {"right": "tab:blue", "left": "tab:green", "rear": "tab:red"}
@@ -580,17 +612,27 @@ def plot_combined_overlay(out_dir, front_pts_xy, lidar_xy, cfg, gaps=None):
     text_extra = (lambda ax, t=text: _add_corner_text(ax, t)) if text else None
     extra = _combine_extra(bbox_extra, text_extra)
     return viz.topdown_scatter(
-        os.path.join(out_dir, "step4_combined_overlay_topdown.png"), series, cfg,
-        title="Step 4: all-lidar aligned overlay onto front map", extra=extra)
+        os.path.join(out_dir, f"{tag}_combined_overlay_topdown.png"), series, cfg,
+        title=f"Step 4: all-lidar aligned overlay onto front map{suffix}", extra=extra)
 
 
-def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts_xy, cfg, world_xy, gap=None):
+def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts_xy, cfg, world_xy,
+                     gap=None, eval_only=False):
     """Convergence curve, before/after residual histogram, aligned-overlay onto
     the front map, and per-axis translation curvature — visual/quantitative
     sanity checks beyond the summary line printed by _record(). world_xy is the
     precomputed aligned_world_xy() output (shared with the overlay-gap stat in
     _run() so both use the exact same point population); gap is that stat's
-    result, annotated as text on the overlay plot."""
+    result, annotated as text on the overlay plot.
+
+    eval_only=True (a fixed given tf scored via evaluate_only(), not optimized):
+    res["E"] == E0 so there is nothing to converge or compare before/after —
+    the convergence plot is skipped (empty history already does this), the
+    residual histogram is a single distribution instead of a before/after
+    overlay, and filenames/titles are tagged "step4_eval_*" / "(eval)" so they
+    don't collide with or get confused for an optimize()-produced result."""
+    tag = "step4_eval" if eval_only else "step4"
+    suffix = " (eval: given tf, not optimized)" if eval_only else ""
     paths = []
     hist = res["history"]
     if hist:
@@ -604,7 +646,7 @@ def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts
                 if i > 0:
                     vlines.append((i - 0.5, dict(color="gray", linestyle=":", linewidth=1)))
         paths.append(viz.line_plot(
-            os.path.join(out_dir, f"step4_{name}_convergence.png"),
+            os.path.join(out_dir, f"{tag}_{name}_convergence.png"),
             [(x, rmse_cm, {"color": "steelblue", "linewidth": 1.0, "marker": "o", "markersize": 2})],
             cfg, title=f"Step 4 [{name}]: RMSE convergence (coarse->fine voxel scales {voxels_seen})",
             xlabel="global iteration", ylabel="rmse [cm]", vlines=vlines))
@@ -616,13 +658,20 @@ def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts
     map_blocks = [Block(p, M, sp, sn, tree, corr, huber, 1.0) for p, M, _t in scans]
     inter_blocks = [Block(pb, np.eye(4), rp, rn, tr, corr, huber, 1.0) for (pb, rp, rn, tr) in geoms]
     if map_blocks or inter_blocks:
-        r_before = np.concatenate([_collect_residuals(E0, map_blocks), _collect_residuals(E0, inter_blocks)])
-        r_after = np.concatenate([_collect_residuals(res["E"], map_blocks), _collect_residuals(res["E"], inter_blocks)])
-        paths.append(viz.hist_compare_plot(
-            os.path.join(out_dir, f"step4_{name}_residual_hist.png"),
-            r_before * 100, r_after * 100, cfg, bins=60,
-            title=f"Step 4 [{name}]: point-to-plane residuals (init tf_static vs. final)",
-            xlabel="signed residual [cm]", labels=("init", "final")))
+        if eval_only:
+            r_final = np.concatenate([_collect_residuals(res["E"], map_blocks), _collect_residuals(res["E"], inter_blocks)])
+            paths.append(viz.hist_plot(
+                os.path.join(out_dir, f"{tag}_{name}_residual_hist.png"), r_final * 100, cfg, bins=60,
+                title=f"Step 4 [{name}]{suffix}: point-to-plane residuals",
+                xlabel="signed residual [cm]"))
+        else:
+            r_before = np.concatenate([_collect_residuals(E0, map_blocks), _collect_residuals(E0, inter_blocks)])
+            r_after = np.concatenate([_collect_residuals(res["E"], map_blocks), _collect_residuals(res["E"], inter_blocks)])
+            paths.append(viz.hist_compare_plot(
+                os.path.join(out_dir, f"{tag}_{name}_residual_hist.png"),
+                r_before * 100, r_after * 100, cfg, bins=60,
+                title=f"Step 4 [{name}]: point-to-plane residuals (init tf_static vs. final)",
+                xlabel="signed residual [cm]", labels=("init", "final")))
 
     if len(world_xy):
         ps, pa = float(cfg["viz_point_size"]), float(cfg["viz_point_alpha"])
@@ -631,20 +680,23 @@ def plot_lidar_diag(out_dir, name, res, E0, map_targets, scans, geoms, front_pts
         text_extra = (lambda ax, t=_gap_text(gap): _add_corner_text(ax, t)) if gap else None
         extra = _combine_extra(bbox_extra, text_extra)
         paths.append(viz.topdown_scatter(
-            os.path.join(out_dir, f"step4_{name}_overlay_topdown.png"),
+            os.path.join(out_dir, f"{tag}_{name}_overlay_topdown.png"),
             [(_crop_xy(front_pts_xy, bbox), {"c": "lightgray", "s": ps, "alpha": pa, "label": "front map"}),
              (world_xy, {"c": "crimson", "s": ps, "alpha": pa, "label": f"{name} (aligned)"})],
-            cfg, title=f"Step 4 [{name}]: aligned overlay onto front map", extra=extra))
+            cfg, title=f"Step 4 [{name}]{suffix}: aligned overlay onto front map", extra=extra))
 
     cx, cy, cz = res["axis_curv_trans"]
     paths.append(viz.bar_plot(
-        os.path.join(out_dir, f"step4_{name}_axis_curv.png"), ["x", "y", "z"], [cx, cy, cz],
+        os.path.join(out_dir, f"{tag}_{name}_axis_curv.png"), ["x", "y", "z"], [cx, cy, cz],
         cfg, title=f"Step 4 [{name}]: translation-axis Hessian curvature (low = weakly observable)",
         ylabel="curvature", log_y=True))
     return paths
 
 
 def _run(args, cfg):
+    if args.eval_only and not args.tf_override:
+        print("  [error] --eval-only requires --tf-override (the fixed tf to evaluate)")
+        return 1
     if cfg["icp_method"] != "point_to_plane":
         print(f"  [warn] icp_method={cfg['icp_method']} not implemented; using point_to_plane")
     rtk = args.rtk_poses or os.path.join(args.out_dir, "rtk_poses.npy")
@@ -675,7 +727,8 @@ def _run(args, cfg):
         E0 = override.get(f"lidar_{name}", E0)
         geoms = build_inter_geoms(args.out_dir, "front", name, E_front, traj, cfg, args.max_scans)
         print(f"[{name}] {len(scans)} map-scans, {len(geoms)} front-{name} overlap pairs")
-        res = optimize(E0, map_targets, scans, geoms, cfg, tag=name)
+        res = (evaluate_only(E0, map_targets, scans, geoms, cfg) if args.eval_only
+               else optimize(E0, map_targets, scans, geoms, cfg, tag=name))
         E[name] = res["E"]
         _record(results, yaml_tf, name, res["E"], E0, res, len(scans), len(geoms))
         lidar_xy[name] = aligned_world_xy(scans, res["E"], cap_scans)
@@ -687,7 +740,8 @@ def _run(args, cfg):
                   f"p90={gap['p90']:.2f} p99={gap['p99']:.2f} max={gap['max']:.2f}")
         if cfg["viz_enabled"] and not args.no_viz:
             paths = plot_lidar_diag(args.out_dir, name, res, E0, map_targets, scans, geoms,
-                                    front_pts[:, :2], cfg, lidar_xy[name], gaps[name])
+                                    front_pts[:, :2], cfg, lidar_xy[name], gaps[name],
+                                    eval_only=args.eval_only)
             for p in paths:
                 print(f"  wrote {p}")
 
@@ -699,7 +753,8 @@ def _run(args, cfg):
         if ref in E:
             geoms += build_inter_geoms(args.out_dir, ref, "rear", E[ref], traj, cfg, args.max_scans)
     print(f"[rear] {len(scans)} map-scans, {len(geoms)} rear-(right/left) overlap pairs")
-    res = optimize(E0, map_targets, scans, geoms, cfg, tag="rear")
+    res = (evaluate_only(E0, map_targets, scans, geoms, cfg) if args.eval_only
+           else optimize(E0, map_targets, scans, geoms, cfg, tag="rear"))
     _record(results, yaml_tf, "rear", res["E"], E0, res, len(scans), len(geoms))
     lidar_xy["rear"] = aligned_world_xy(scans, res["E"], cap_scans)
     gaps["rear"] = overlay_gap_stats(front_tree_xy, lidar_xy["rear"])
@@ -710,21 +765,25 @@ def _run(args, cfg):
               f"p90={gap['p90']:.2f} p99={gap['p99']:.2f} max={gap['max']:.2f}")
     if cfg["viz_enabled"] and not args.no_viz:
         paths = plot_lidar_diag(args.out_dir, "rear", res, E0, map_targets, scans, geoms,
-                                front_pts[:, :2], cfg, lidar_xy["rear"], gaps["rear"])
+                                front_pts[:, :2], cfg, lidar_xy["rear"], gaps["rear"],
+                                eval_only=args.eval_only)
         for p in paths:
             print(f"  wrote {p}")
-        p = plot_combined_overlay(args.out_dir, front_pts[:, :2], lidar_xy, cfg, gaps)
+        p = plot_combined_overlay(args.out_dir, front_pts[:, :2], lidar_xy, cfg, gaps,
+                                   eval_only=args.eval_only)
         print(f"  wrote {p}")
 
-    with open(os.path.join(args.out_dir, "lidar_to_lidar_result.json"), "w") as f:
+    result_name = "lidar_to_lidar_eval_result.json" if args.eval_only else "lidar_to_lidar_result.json"
+    tf_name = "lidar_to_lidar_eval_tf.yaml" if args.eval_only else "lidar_to_lidar_tf.yaml"
+    with open(os.path.join(args.out_dir, result_name), "w") as f:
         json.dump(results, f, indent=2)
     try:
         import yaml
-        with open(os.path.join(args.out_dir, "lidar_to_lidar_tf.yaml"), "w") as f:
+        with open(os.path.join(args.out_dir, tf_name), "w") as f:
             yaml.safe_dump({"drs_base_link": yaml_tf}, f, sort_keys=False)
     except Exception as e:  # noqa: BLE001
         print(f"  [warn] could not write yaml: {e}")
-    print(f"  wrote lidar_to_lidar_result.json / lidar_to_lidar_tf.yaml to {args.out_dir}")
+    print(f"  wrote {result_name} / {tf_name} to {args.out_dir}")
     return 0
 
 
@@ -738,6 +797,11 @@ def main(argv=None):
                          "(MUST match the --tf-override used for Step 3's front map)")
     ap.add_argument("--max-scans", type=int, default=None)
     ap.add_argument("--no-viz", action="store_true", help="skip PNG plot generation")
+    ap.add_argument("--eval-only", action="store_true",
+                    help="verification-only mode: score the --tf-override tf as-is against "
+                         "the front map/overlap (no LM optimization) and write "
+                         "step4_eval_*/lidar_to_lidar_eval_* outputs, e.g. to check the "
+                         "accuracy of a tf produced by a different/previous calibration method")
     args = ap.parse_args(argv)
 
     cfg = common.load_config(args.config)
