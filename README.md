@@ -105,3 +105,21 @@ pytest tests/
 ```
 
 Unit tests with a synthetic MCAP fixture are in `tests/test_replace_params.py`.
+
+## Third-Party Dependencies
+
+This repository is [MIT licensed](LICENSE). All code in this repository is original; no third-party source code is vendored or embedded here. Third-party functionality is used only via standard package imports — either pip-installed packages or a sourced ROS 2 environment — so none of the licenses below impose any additional restriction on this project's own license.
+
+| Package | License | Used by |
+|---|---|---|
+| numpy | BSD-3-Clause | all tools |
+| scipy | BSD-3-Clause | `tools/auto-calib` |
+| open3d | MIT | `tools/auto-calib` (Step 4 ICP) |
+| opencv-python (OpenCV) | Apache-2.0 | `tools/auto-calib` (Step 5), `tools/lidar-camera` |
+| mcap / mcap-ros2-support | Apache-2.0 | MCAP bag reading (all tools) |
+| pyyaml | MIT | config / TF YAML parsing |
+| matplotlib | Matplotlib License (BSD-style) | `tools/auto-calib`, `tools/lidar-camera` (`tune_extrinsic.py`) |
+| PySide6 (Qt for Python) | LGPLv3 (or commercial) | `tools/lidar-camera/tune_extrinsic.py` only |
+| ROS 2 Humble (`rclpy`, `rosbag2_py`, `sensor_msgs`, `tf2_msgs`, `geometry_msgs`, `builtin_interfaces`, `nav_msgs`) | Apache-2.0 | bag/message I/O (all tools); not pip-installed — provided by a sourced ROS 2 Humble environment |
+
+Note on PySide6: it is used only as a dynamically imported library (pip package) in one optional GUI tool; no Qt source is bundled in this repository, so LGPLv3's linking terms are satisfied without any special build steps.
