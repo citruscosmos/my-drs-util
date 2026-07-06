@@ -1,0 +1,14 @@
+# pip-installable dependencies for tools/gps-route/
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# NOTE: rclpy and sensor_msgs are ROS 2 packages and cannot be installed via pip.
+#       They must be available through a sourced ROS 2 environment
+#       (e.g. source /opt/ros/humble/setup.bash).
+
+numpy
+mcap
+mcap-ros2-support  # decodes oxts_msgs/msg/Ncom directly from its embedded schema, no oxts_msgs package needed
+matplotlib>=3.7  # 3.7+ required for NumPy 2.x compatibility
+contextily        # OpenStreetMap tile basemap (requires network access)
