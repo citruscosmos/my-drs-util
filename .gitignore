@@ -40,3 +40,5 @@ Thumbs.db
 output/
 proj_output/
 tools/auto-calib/docs/previous-method-result/
+tools/auto-calib/*.yaml
+tools/auto-calib/result*
