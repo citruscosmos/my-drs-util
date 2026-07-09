@@ -159,6 +159,71 @@ def pick_scenes(cam_ts, lidar_ts, n_scenes, max_dt_ms):
     return scenes
 
 
+def speed_profile(rtk_poses_path):
+    """(t_mid_ns, speed_mps) from consecutive rtk_poses.npy samples (~50Hz),
+    t_mid being the midpoint timestamp of each speed sample."""
+    poses = np.load(rtk_poses_path)
+    ts = poses[:, 0].astype(np.int64)
+    pos = poses[:, 1:4]
+    order = np.argsort(ts, kind="stable")
+    ts, pos = ts[order], pos[order]
+    dt_s = np.diff(ts) / 1e9
+    speed = np.linalg.norm(np.diff(pos, axis=0), axis=1) / np.clip(dt_s, 1e-6, None)
+    t_mid = (ts[:-1] + ts[1:]) // 2
+    return t_mid, speed
+
+
+def pick_low_speed_scenes(t_mid, speed, cam_ts, lidar_ts, speed_thresh_mps, max_dt_ms,
+                           min_episode_dur_s=0.5):
+    """One scene per contiguous low-speed episode (speed <= speed_thresh_mps),
+    at that episode's minimum-speed instant -- i.e. each stop / crawl the
+    vehicle makes yields exactly one scene, timed to its slowest moment
+    (least motion blur / lidar-camera sync error). Episodes shorter than
+    min_episode_dur_s are dropped: speed noise flickering across the threshold
+    for a sample or two is not a real stop/crawl, just estimation jitter."""
+    below = speed <= speed_thresh_mps
+    episodes = []
+    start = None
+    for i, b in enumerate(below):
+        if b and start is None:
+            start = i
+        elif not b and start is not None:
+            episodes.append((start, i - 1))
+            start = None
+    if start is not None:
+        episodes.append((start, len(below) - 1))
+    episodes = [(s, e) for s, e in episodes
+                if (t_mid[e] - t_mid[s]) / 1e9 >= min_episode_dur_s]
+
+    lidar_idx = np.array([i for i, _ in lidar_ts])
+    lidar_t = np.array([t for _, t in lidar_ts], dtype=np.int64)
+    cam_idx = np.array([i for i, _ in cam_ts])
+    cam_t = np.array([t for _, t in cam_ts], dtype=np.int64)
+
+    scenes = []
+    seen_lidar_idx = set()
+    for ep, (s, e) in enumerate(episodes):
+        j = s + int(np.argmin(speed[s:e + 1]))
+        t_target = int(t_mid[j])
+        v_min_kmh = float(speed[j] * 3.6)
+        dur_s = float((t_mid[e] - t_mid[s]) / 1e9)
+        li = int(np.argmin(np.abs(lidar_t - t_target)))
+        lt = int(lidar_t[li])
+        if lidar_idx[li] in seen_lidar_idx:
+            continue
+        ci = int(np.argmin(np.abs(cam_t - lt)))
+        dt_ms = abs(int(cam_t[ci]) - lt) / 1e6
+        if dt_ms > max_dt_ms:
+            print(f"  [skip] episode{ep} v_min={v_min_kmh:.2f}km/h dur={dur_s:.1f}s t={t_target}: "
+                  f"nearest camera frame is {dt_ms:.1f}ms away (> {max_dt_ms}ms)")
+            continue
+        seen_lidar_idx.add(lidar_idx[li])
+        scenes.append({"lidar_idx": int(lidar_idx[li]), "lidar_t": lt,
+                        "cam_idx": int(cam_idx[ci]), "cam_t": int(cam_t[ci]), "dt_ms": dt_ms,
+                        "episode": ep, "v_min_kmh": v_min_kmh, "episode_dur_s": dur_s})
+    return scenes
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Step 5 verification: before/after projection overlays")
     ap.add_argument("bag")
@@ -167,7 +232,15 @@ def main(argv=None):
     ap.add_argument("--result-json", default=None, help="explicit Step 5 result JSON (auto-detected if omitted)")
     ap.add_argument("--tf-override", default=None)
     ap.add_argument("--config", default=None)
-    ap.add_argument("--n-scenes", type=int, default=5)
+    ap.add_argument("--scene-mode", choices=["low-speed", "even"], default="low-speed",
+                     help="low-speed: one scene per contiguous low-speed episode, at its minimum-speed "
+                          "instant (default). even: n-scenes evenly spaced across the whole bag")
+    ap.add_argument("--speed-thresh-kmh", type=float, default=3.0,
+                     help="low-speed mode: episode = contiguous stretch with speed <= this [km/h]")
+    ap.add_argument("--min-episode-dur-s", type=float, default=0.5,
+                     help="low-speed mode: drop episodes shorter than this (speed-noise flicker)")
+    ap.add_argument("--rtk-poses", default=None, help="low-speed mode: default <out-dir>/rtk_poses.npy")
+    ap.add_argument("--n-scenes", type=int, default=5, help="even mode: number of evenly spaced scenes")
     ap.add_argument("--max-cam-lidar-dt-ms", type=float, default=60.0,
                      help="drop a scene if no camera frame is within this of the lidar scan")
     ap.add_argument("--point-radius-px", type=int, default=1)
@@ -208,9 +281,23 @@ def main(argv=None):
     cam_ts = pass_timestamps(files, cam_topic, CompressedImage)
     print(f"  pass 2/4: scanning timestamps on {lidar_topic}")
     lidar_ts = pass_timestamps(files, lidar_topic, PointCloud2)
-    scenes = pick_scenes(cam_ts, lidar_ts, args.n_scenes, args.max_cam_lidar_dt_ms)
-    if not scenes:
-        raise SystemExit("no scene had a camera frame within --max-cam-lidar-dt-ms of a lidar scan")
+
+    if args.scene_mode == "low-speed":
+        rtk_poses_path = args.rtk_poses or os.path.join(args.out_dir, "rtk_poses.npy")
+        t_mid, speed = speed_profile(rtk_poses_path)
+        scenes = pick_low_speed_scenes(t_mid, speed, cam_ts, lidar_ts,
+                                        args.speed_thresh_kmh / 3.6, args.max_cam_lidar_dt_ms,
+                                        args.min_episode_dur_s)
+        if not scenes:
+            raise SystemExit(f"no low-speed episode (<= {args.speed_thresh_kmh} km/h) in "
+                              f"{rtk_poses_path} yielded a usable scene")
+        for sc in scenes:
+            print(f"  episode{sc['episode']}: v_min={sc['v_min_kmh']:.2f}km/h "
+                  f"dur={sc['episode_dur_s']:.1f}s -> lidar_t={sc['lidar_t']}")
+    else:
+        scenes = pick_scenes(cam_ts, lidar_ts, args.n_scenes, args.max_cam_lidar_dt_ms)
+        if not scenes:
+            raise SystemExit("no scene had a camera frame within --max-cam-lidar-dt-ms of a lidar scan")
     print(f"  {len(scenes)} scenes selected")
 
     want_lidar = {s["lidar_idx"] for s in scenes}
