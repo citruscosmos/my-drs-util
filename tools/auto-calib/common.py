@@ -490,6 +490,7 @@ DEFAULT_CONFIG = {
     "canny_low": 50,
     "canny_high": 150,
     "dist_transform_max": 20.0,        # clamp the distance field [px]
+    "image_scale": 0.5,                # downscale raw images before Canny/DT [0-1]; whole camera's frames are held in RAM at once, native 4K OOMs
     "lbfgsb_max_iter": 200,
     "lbfgsb_ftol": 1e-6,
     "cam_proj_max_points": 8000,       # projected map points per frame (subsample)
@@ -541,8 +542,13 @@ DEFAULT_CONFIG = {
     "v3_min_parallax_deg": 2.0,        # reject a triangulated point below this max ray-angle spread
     "v3_max_reproj_norm": 0.02,        # reject triangulation if mean normalized-coord reproj error exceeds this
     "v3_max_tracks_per_cam": 20000,    # cap accumulated tracks per camera (perf)
-    "v3_snap_max_dist": 0.5,           # max distance [m] to snap a triangulated point onto the LiDAR map
-    "v3_outer_iters": 3,               # reconstruct<->register outer iterations
+    "v3_triangulate_obs_stride": 4,    # use every Nth track observation for ray intersection
+                                        # (widens baseline; final refinement still uses all obs)
+    # Coarse-to-fine snap distance per outer iter (holds at the last value beyond the
+    # schedule length); a fixed tight threshold can't recover rotation error beyond
+    # ~1deg at typical triangulation depths (depth * tan(theta) blows past it).
+    "v3_snap_max_dist_schedule": [3.0, 1.5, 0.75, 0.5],
+    "v3_outer_iters": 5,               # reconstruct<->register outer iterations
     "v3_huber_px": 3.0,                # robust loss scale for the reprojection GN [px]
     "v3_trans_bound_m": 0.5,           # search bound around tf_static init [m]
     "v3_rot_bound_rad": 0.3,           # search bound around tf_static init [rad]

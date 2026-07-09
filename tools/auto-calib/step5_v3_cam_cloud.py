@@ -90,11 +90,31 @@ def iter_frames(files, cam, cfg, max_frames):
         n += 1
 
 
+# Rolling-shutter line-scan time [s] by camera (hardware spec: frame_period ==
+# num_lines*line_scan_s + fixed_exposure_s for all three sensor types below).
+# header.stamp is calibrated to the image-CENTER row's capture time, so a
+# feature at row v needs a (v - height/2) * line_scan_s correction relative to
+# header.stamp. Fisheye cameras (8-11) are excluded: their header.stamp is not
+# calibrated to the center-row convention.
+CAM_LINE_SCAN_S = {
+    0: 0.02e-3, 1: 0.02e-3, 4: 0.02e-3, 5: 0.02e-3,          # C3: 2160 lines
+    2: 0.0125e-3, 3: 0.0125e-3, 6: 0.0125e-3, 7: 0.0125e-3,  # C2: 1860 lines
+}
+
+
+def rolling_shutter_t_ns(cam, t_ns, v, height):
+    line_s = CAM_LINE_SCAN_S.get(cam)
+    if line_s is None:
+        return t_ns
+    return t_ns + round((v - height / 2.0) * line_s * 1e9)
+
+
 def klt_track(files, cam, cfg, max_frames):
     """Forward-backward-checked KLT tracking. Returns a list of tracks, each a
-    list of (t_ns, u, v); re-seeds goodFeaturesToTrack when the active set
-    thins, and force-closes tracks at v3_track_max_len (bounds triangulation
-    baseline/cost, not an accuracy requirement)."""
+    list of (t_ns, u, v) with t_ns already rolling-shutter-corrected per point
+    (see rolling_shutter_t_ns); re-seeds goodFeaturesToTrack when the active
+    set thins, and force-closes tracks at v3_track_max_len (bounds
+    triangulation baseline/cost, not an accuracy requirement)."""
     import cv2
 
     max_len = int(cfg["v3_track_max_len"])
@@ -117,10 +137,12 @@ def klt_track(files, cam, cfg, max_frames):
     active_pts, active_tracks, prev_gray = None, [], None
 
     for t_ns, gray in iter_frames(files, cam, cfg, max_frames):
+        height = gray.shape[0]
         if prev_gray is None:
             pts = seed(gray, None)
             active_pts = pts
-            active_tracks = ([[(t_ns, float(p[0][0]), float(p[0][1]))] for p in pts]
+            active_tracks = ([[(rolling_shutter_t_ns(cam, t_ns, float(p[0][1]), height),
+                                float(p[0][0]), float(p[0][1]))] for p in pts]
                               if pts is not None else [])
             prev_gray = gray
             continue
@@ -140,7 +162,7 @@ def klt_track(files, cam, cfg, max_frames):
                     completed.append(active_tracks[i])
                 continue
             u, v = float(fwd[i, 0, 0]), float(fwd[i, 0, 1])
-            tr = active_tracks[i] + [(t_ns, u, v)]
+            tr = active_tracks[i] + [(rolling_shutter_t_ns(cam, t_ns, v, height), u, v)]
             if len(tr) >= max_len:
                 completed.append(tr)
                 continue
@@ -154,7 +176,7 @@ def klt_track(files, cam, cfg, max_frames):
                 for p in seeded:
                     u, v = float(p[0][0]), float(p[0][1])
                     next_pts.append([[u, v]])
-                    next_tracks.append([(t_ns, u, v)])
+                    next_tracks.append([(rolling_shutter_t_ns(cam, t_ns, v, height), u, v)])
 
         active_pts = np.array(next_pts, np.float32) if next_pts else None
         active_tracks = next_tracks
@@ -174,9 +196,18 @@ def triangulate_track(track, params, drs_T_lidar, traj, unproject_fn, cfg):
     (P_world, mean_reproj_norm, parallax_deg) or None if filtered out
     (insufficient parallax, behind the camera in any view, or high
     reprojection error — see docs/architecture.md Step 5 v3 for why parallax
-    matters: translation is only observable via depth/parallax diversity)."""
-    ts = np.array([o[0] for o in track], np.float64)
-    uv = np.array([[o[1], o[2]] for o in track], np.float64)
+    matters: translation is only observable via depth/parallax diversity).
+
+    Only every v3_triangulate_obs_stride-th observation is used for the ray
+    intersection itself (widens the baseline between views cheaply — adjacent
+    tracked frames are close together in time/position and add little
+    independent parallax while adding tracking noise); the final reprojection
+    refinement in step5_v3_register.py still uses every observation in the
+    track, since that step benefits from more residual terms."""
+    stride = max(1, int(cfg["v3_triangulate_obs_stride"]))
+    sub = track[::stride] if len(track) // stride >= 2 else [track[0], track[-1]]
+    ts = np.array([o[0] for o in sub], np.float64)
+    uv = np.array([[o[1], o[2]] for o in sub], np.float64)
     ray_n = unproject_fn(uv)
 
     R_wo, t_wo = camera_poses_in_map_batch(params, drs_T_lidar, traj, ts)

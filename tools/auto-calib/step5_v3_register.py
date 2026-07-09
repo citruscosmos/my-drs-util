@@ -25,6 +25,17 @@ iteration re-triangulates with the latest extrinsic estimate, so triangulation
 error introduced by an imperfect estimate shrinks as the estimate improves
 (benign for the small errors this refines from — tf_static is already good).
 
+The snap distance follows a coarse-to-fine schedule (v3_snap_max_dist_schedule,
+holding at the last value once outer iterations exceed the schedule length)
+rather than a single fixed threshold. Rotation error turns into a snap-distance
+error proportional to point depth (depth * tan(theta)), and triangulated points
+can span tens of meters, so a single-digit-degree error already pushes most
+points outside a tight fixed threshold before the extrinsic has a chance to
+improve — verified empirically on camera1 via --self-test: 63% snap rate at
+the true extrinsic collapsed to 39% under a 3deg perturbation, and never
+recovered over 3 outer iterations at a fixed 0.5m threshold. Starting loose
+and tightening lets far points pull the estimate in the right direction first.
+
 Reuses Step 4's point-to-plane registration primitives (build_target for the
 LiDAR map KD-tree+normals) but NOT its analytic SE(3) Jacobian — the
 reprojection residual here uses scipy.optimize.least_squares (numerical
@@ -112,12 +123,13 @@ def optimize_camera_v3(files, cam, out_dir, traj, map_target, cfg, override,
     bound = np.array([tb, tb, tb, rb, rb, rb])
     lo, hi = x0 - bound, x0 + bound
     huber_px = float(cfg["v3_huber_px"])
-    snap_max = float(cfg["v3_snap_max_dist"])
+    snap_schedule = [float(v) for v in cfg["v3_snap_max_dist_schedule"]]
     max_nfev = int(cfg["v3_ls_max_nfev"])
 
     params = x0.copy() if start_params is None else np.asarray(start_params, np.float64)
     history = []
     for outer in range(int(cfg["v3_outer_iters"])):
+        snap_max = snap_schedule[min(outer, len(snap_schedule) - 1)]
         pts, tr_kept, reprojs, parallaxes = [], [], [], []
         for tr in tracks:
             res = v3c.triangulate_track(tr, params, drs_T_lidar, traj, unproject_fn, cfg)
@@ -150,7 +162,8 @@ def optimize_camera_v3(files, cam, out_dir, traj, map_target, cfg, override,
         params = result.x
         rf = residual_fn(params)
         history.append({
-            "outer_it": outer, "n_triangulated": len(pts), "n_snapped": len(tracks_final),
+            "outer_it": outer, "snap_max_dist": snap_max,
+            "n_triangulated": len(pts), "n_snapped": len(tracks_final),
             "n_obs": len(uv_arr), "resid_px_rms_init": float(np.sqrt(np.mean(r0 ** 2))),
             "resid_px_rms_final": float(np.sqrt(np.mean(rf ** 2))),
             "mean_parallax_deg": float(np.mean(parallaxes)), "mean_reproj_norm": float(np.mean(reprojs)),

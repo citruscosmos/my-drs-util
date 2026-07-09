@@ -142,8 +142,13 @@ def distance_transform(gray, canny_lo, canny_hi, dt_max):
     return np.minimum(dt, dt_max).astype(np.float32)
 
 
-def load_camera_frames(files, cam, cfg, max_frames):
-    """Yield (t_ns, DistanceTransform float32 (H,W)) for strided camera frames."""
+def load_camera_frames(files, cam, cfg, max_frames, resize_to=None):
+    """Yield (t_ns, DistanceTransform float32 (H,W)) for strided camera frames.
+
+    resize_to, if given, is a (w,h) the raw image is downscaled to before
+    Canny/DT -- the DT for every frame is held in RAM simultaneously by the
+    caller (optimize_camera), so at native resolution this is the dominant
+    memory cost (see cfg["image_scale"])."""
     import cv2
     from sensor_msgs.msg import CompressedImage
 
@@ -162,6 +167,8 @@ def load_camera_frames(files, cam, cfg, max_frames):
         img = cv2.imdecode(np.frombuffer(bytes(m.data), np.uint8), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
+        if resize_to is not None:
+            img = cv2.resize(img, resize_to, interpolation=cv2.INTER_AREA)
         t_ns = m.header.stamp.sec * 1_000_000_000 + m.header.stamp.nanosec
         yield t_ns, distance_transform(img, lo, hi, dt_max)
         n += 1
@@ -320,6 +327,16 @@ def optimize_camera(files, cam, out_dir, traj, p_map, cfg, override, max_frames)
 
     lidar = CAM_LIDAR[cam]
     K, D, w, h, model = load_camera_info(files, cam)
+    scale = float(cfg["image_scale"])
+    resize_to = None
+    if scale != 1.0:
+        w2, h2 = max(1, round(w * scale)), max(1, round(h * scale))
+        K = K.copy()
+        K[0, 0] *= w2 / w
+        K[0, 2] *= w2 / w
+        K[1, 1] *= h2 / h
+        K[1, 2] *= h2 / h
+        resize_to, w, h = (w2, h2), w2, h2
     project_fn = make_project_fn(K, D, model)
     drs_T_lidar = load_drs_T_lidar(out_dir, lidar, files, override)
     x0 = np.array(init_cam_extrinsic(files, cam, lidar, override), np.float64)
@@ -327,7 +344,7 @@ def optimize_camera(files, cam, out_dir, traj, p_map, cfg, override, max_frames)
     rng = np.random.default_rng(0)
     max_pts = int(cfg["cam_proj_max_points"])
     frames = []
-    for t_ns, dt in load_camera_frames(files, cam, cfg, max_frames):
+    for t_ns, dt in load_camera_frames(files, cam, cfg, max_frames, resize_to):
         pl = map_points_in_lidar(p_map, drs_T_lidar, traj, t_ns)
         pl = crop_frustum(pl, x0, project_fn, w, h, 50.0, max_pts, rng)
         if len(pl):
