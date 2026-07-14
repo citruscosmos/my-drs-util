@@ -34,11 +34,17 @@ python3 plot_gps_route.py <mcap-or-dir> [--out-dir OUT] [--topics t1,t2] \
 | `--no-basemap` | | off | Skip fetching the OpenStreetMap tile background (for offline use) |
 | `--max-speed` | | `50.0` | Max plausible implied speed in m/s between consecutive fixes (180 km/h). Points implying a faster speed are excluded as a "Speed Jump" (see below). `0` disables the check. |
 
-One PNG is written per matched topic: `gps_route_<sanitized_topic>.png`, plotted
-over an OpenStreetMap tile background (Web Mercator projection), with the
-start (☆) and end (X) marked in blue. A pair of blue dashed lines runs
-parallel to the trajectory at ±`cov-sigma` sigma, showing the reported
-horizontal position uncertainty as a corridor around the path.
+One PNG is written per matched topic, named after the input so a keyword
+search over a directory of output PNGs tells you which bag/folder each route
+came from: `<input-basename>_gps-route.png`, where `<input-basename>` is the
+split-rosbag2 directory name (dir input) or the `.mcap` filename without its
+extension (single-file input). If more than one `NavSatFix` topic is found,
+the sanitized topic name is inserted to disambiguate:
+`<input-basename>_<sanitized_topic>_gps-route.png`. Each PNG is plotted over
+an OpenStreetMap tile background (Web Mercator projection), with the start
+(☆) and end (X) marked in blue. A pair of blue dashed lines runs parallel to
+the trajectory at ±`cov-sigma` sigma, showing the reported horizontal
+position uncertainty as a corridor around the path.
 
 **Coloring — GPS position mode vs. NavSatFix status:** `sensor_msgs/msg/NavSatFix.status.status`
 only distinguishes 4 coarse levels (`NO_FIX`/`FIX`/`SBAS_FIX`/`GBAS_FIX`) and

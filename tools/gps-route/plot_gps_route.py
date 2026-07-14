@@ -375,6 +375,19 @@ def sanitize_topic(topic: str) -> str:
     return topic.strip("/").replace("/", "_")
 
 
+def input_basename(path: str) -> str:
+    """Folder name (dir input) or filename without extension (single-file input).
+
+    Used as the output filename stem so a keyword search over PNGs (e.g. in a
+    file browser) can find the route map and immediately tell which bag/folder
+    it came from.
+    """
+    base = os.path.basename(os.path.normpath(path))
+    if os.path.isfile(path):
+        base = os.path.splitext(base)[0]
+    return base
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input",
@@ -426,6 +439,8 @@ def main(argv=None) -> int:
     else:
         print(f"no {NCOM_TYPE} topic found; falling back to NavSatFix.status.status for coloring")
 
+    base = input_basename(args.input)
+
     ok = 0
     for topic in topics:
         data, status = read_navsatfix(files, topic)
@@ -439,7 +454,9 @@ def main(argv=None) -> int:
         else:
             color_status, style_map, legend_title = status, STATUS_STYLE, "status.status (NavSatFix)"
 
-        out_path = os.path.join(out_dir, f"gps_route_{sanitize_topic(topic)}.png")
+        fname = (f"{base}_gps-route.png" if len(topics) == 1
+                 else f"{base}_{sanitize_topic(topic)}_gps-route.png")
+        out_path = os.path.join(out_dir, fname)
         title = f"GPS route: {topic} ({len(data)} fixes)"
         if plot_route(data, status, color_status, style_map, legend_title, out_path, title,
                        args.require_fix, args.cov_sigma, not args.no_basemap, args.max_speed):
