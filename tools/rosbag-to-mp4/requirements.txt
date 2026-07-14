@@ -1,0 +1,14 @@
+# pip-installable dependencies for tools/rosbag-to-mp4/
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# NOTE: rclpy and sensor_msgs are ROS 2 packages and cannot be installed via pip.
+#       They must be available through a sourced ROS 2 environment
+#       (e.g. source /opt/ros/humble/setup.bash).
+# NOTE: the ffmpeg CLI must also be installed on the system (apt install ffmpeg).
+#       It is invoked as a subprocess, not a Python package.
+
+numpy
+opencv-python
+mcap
