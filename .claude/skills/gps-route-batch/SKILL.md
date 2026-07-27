@@ -1,14 +1,14 @@
 ---
 name: gps-route-batch
-description: Run tools/gps-route over every immediate subfolder of a given parent directory (e.g. an ecu0/ recordings folder), then collect all generated *_gps-route.png files into a sibling "gps-route" folder next to the parent directory. Use when the user asks to run gps-route / generate GPS route maps for "all folders under X" or similar batch requests.
+description: Run tools/gps-route over every immediate subfolder of a given parent directory (e.g. an ecu0/ recordings folder), tagging vehicle maneuvers (lane change, harsh accel/decel, stop) and elapsed-time ticks on each map, then collect all generated *_gps-route.png and *_maneuvers.csv files into a sibling "gps-route" folder next to the parent directory. Use when the user asks to run gps-route / generate GPS route maps for "all folders under X" or similar batch requests.
 ---
 
 # gps-route-batch
 
 Batch-runs `tools/gps-route/batch_plot_gps_route.py` over every immediate
-subfolder of a given directory, then consolidates the resulting PNGs into a
-`gps-route/` folder that sits **next to** (same hierarchy level as) the input
-directory — not inside it.
+subfolder of a given directory, then consolidates the resulting PNGs (and
+maneuver CSV sidecars) into a `gps-route/` folder that sits **next to** (same
+hierarchy level as) the input directory — not inside it.
 
 Example: input `/media/autoware/COMLOPS/ecu0` → output PNGs end up in
 `/media/autoware/COMLOPS/gps-route/`.
@@ -32,18 +32,31 @@ are importable from the system `python3`):
 
 ```bash
 cd <repo_root>/tools/gps-route
-python3 batch_plot_gps_route.py <input_dir>
+python3 batch_plot_gps_route.py <input_dir> -- --tag-maneuvers
 ```
 
-This writes `<subfolder-name>_gps-route.png` back into each subfolder itself
-(default `--out-dir` behavior — no `--out-dir` flag needed). A failure in one
+`--tag-maneuvers` is opt-in on `plot_gps_route.py` (default off) and is what
+enables the operation-event overlay: it detects lane-change / harsh-accel /
+harsh-decel / stop events (from a `sensor_msgs/msg/Imu` topic, falling back
+to a lower-accuracy GPS-position-derivative estimate when no Imu topic
+exists) and marks them on the map, plus writes a
+`<subfolder-name>_maneuvers.csv` sidecar per subfolder. Everything after
+`--` is forwarded verbatim to `plot_gps_route.py`, so other flags
+(`--no-basemap`, `--cov-sigma`, etc.) can be appended the same way if asked
+for. Elapsed-time tick labels (every 30s along the route, `--time-tick-interval`
+to change) are always on — no flag needed unless the user wants a different
+interval or to disable them (`--time-tick-interval 0`).
+
+This writes `<subfolder-name>_gps-route.png` (and, with `--tag-maneuvers`,
+`<subfolder-name>_maneuvers.csv`) back into each subfolder itself (default
+`--out-dir` behavior — no `--out-dir` flag needed). A failure in one
 subfolder (no NavSatFix topic, no .mcap files, etc.) is logged and skipped;
 the batch continues. The final line reports `[batch] done: N ok, M failed,
 out of T subfolder(s)` — this run can take a while for large bags (roughly
 15-20s per subfolder observed in practice), so prefer running it in the
 background and polling the log rather than blocking.
 
-## Step 3 — Consolidate PNGs into the sibling gps-route folder
+## Step 3 — Consolidate PNGs and maneuver CSVs into the sibling gps-route folder
 
 The destination is the parent of `<input_dir>`, with a `gps-route` folder
 alongside it — i.e. `dirname(<input_dir>)/gps-route`, NOT
@@ -52,17 +65,18 @@ alongside it — i.e. `dirname(<input_dir>)/gps-route`, NOT
 ```bash
 dest="$(dirname "<input_dir>")/gps-route"
 mkdir -p "$dest"
-find "<input_dir>" -maxdepth 2 -name "*_gps-route.png" -exec mv -t "$dest" {} +
+find "<input_dir>" -maxdepth 2 \( -name "*_gps-route.png" -o -name "*_maneuvers.csv" \) -exec mv -t "$dest" {} +
 ```
 
 ## Step 4 — Verify and report
 
 ```bash
-ls "$dest" | wc -l
-find "<input_dir>" -maxdepth 2 -name "*_gps-route.png" | wc -l   # should be 0 after the move
+ls "$dest"/*_gps-route.png | wc -l
+ls "$dest"/*_maneuvers.csv | wc -l
+find "<input_dir>" -maxdepth 2 \( -name "*_gps-route.png" -o -name "*_maneuvers.csv" \) | wc -l   # should be 0 after the move
 ```
 
 Report to the user: how many subfolders were processed, success/fail counts
-from the batch tool's summary line, and the final PNG count in the
+from the batch tool's summary line, and the final PNG/CSV counts in the
 destination folder. Raw recording subfolders under `<input_dir>` are never
-moved or deleted by this skill — only the generated PNGs.
+moved or deleted by this skill — only the generated PNGs and CSV sidecars.
