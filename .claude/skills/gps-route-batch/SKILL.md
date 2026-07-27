@@ -27,13 +27,29 @@ ls -la <input_dir>
 
 Each subfolder is expected to be a single `.mcap` file or a split rosbag2
 directory (`*.mcap` files, `metadata.yaml` optional — the tool globs
-`*.mcap`). Run from the repo root (no special venv activation needed; deps
-are importable from the system `python3`):
+`*.mcap`). The system `python3` does NOT have the required deps (`mcap`,
+`rclpy`, `sensor_msgs`) — use the repo's `.venv` instead:
 
 ```bash
 cd <repo_root>/tools/gps-route
-python3 batch_plot_gps_route.py <input_dir> -- --tag-maneuvers
+<repo_root>/.venv/bin/python3 batch_plot_gps_route.py <input_dir> -- --tag-maneuvers
 ```
+
+**Before running at scale, confirm the OSM basemap actually renders** — the
+map is otherwise blank (no roads/imagery, just the plotted route on a white
+background), which defeats the point of a route map. Check for
+`contextily`, the tile-fetching lib, in the venv first:
+
+```bash
+<repo_root>/.venv/bin/python3 -c "import contextily" || <repo_root>/.venv/bin/python3 -m pip install contextily
+```
+
+If missing, `plot_gps_route.py` silently degrades — it prints
+`[warn] basemap fetch failed (No module named 'contextily'); plotting
+without it` to stderr and still exits 0, so a naive glance at "N ok, 0
+failed" will not catch a batch that ran with no basemap at all. Do one
+single-folder run first and open the resulting PNG to confirm the map tiles
+are actually there before committing to a long batch run.
 
 `--tag-maneuvers` is opt-in on `plot_gps_route.py` (default off) and is what
 enables the operation-event overlay: it detects lane-change / harsh-accel /
@@ -75,6 +91,27 @@ ls "$dest"/*_gps-route.png | wc -l
 ls "$dest"/*_maneuvers.csv | wc -l
 find "<input_dir>" -maxdepth 2 \( -name "*_gps-route.png" -o -name "*_maneuvers.csv" \) | wc -l   # should be 0 after the move
 ```
+
+Also grep the batch log for basemap failures — a per-tile fetch failure
+(e.g. a transient DNS blip resolving `tile.openstreetmap.org`) doesn't fail
+the subfolder, it just silently produces a blank-background map for it:
+
+```bash
+grep -B8 "basemap fetch failed" <batch_log>   # shows which "[batch] (i/N) <subfolder>" runs were affected
+```
+
+For any affected subfolder, re-run just that one directly (not through the
+batch script) once network access is confirmed working, e.g.:
+
+```bash
+<repo_root>/.venv/bin/python3 plot_gps_route.py <input_dir>/<subfolder> --out-dir <input_dir>/<subfolder> --tag-maneuvers
+```
+
+If the destination `gps-route` folder is owned by `root` with no write
+access for the current user (seen on NAS-mounted parents), `mv` in Step 3
+fails per-file with "permission denied" while still reporting nonzero
+counts moved for others — ask the user to `chmod`/`chown` it, then re-run
+Step 3.
 
 Report to the user: how many subfolders were processed, success/fail counts
 from the batch tool's summary line, and the final PNG/CSV counts in the
