@@ -22,9 +22,19 @@ from mcap.reader import make_reader
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import NavSatFix
 
+import maneuver_detection
+
 NAVSATFIX_TYPE = "sensor_msgs/msg/NavSatFix"
 NCOM_TYPE = "oxts_msgs/msg/Ncom"
 WGS84_R = 6378137.0  # equatorial radius [m]
+
+# maneuver_type -> (edge color, marker, legend label), for --tag-maneuvers.
+MANEUVER_MARKER_STYLE = [
+    ("lane_change", "magenta", "D", "lane change"),
+    ("harsh_accel", "red", "^", "harsh accel"),
+    ("harsh_decel", "darkred", "v", "harsh decel/brake"),
+    ("stop", "black", "s", "stop"),
+]
 
 # sensor_msgs/msg/NavSatStatus.status values -> (color, label). Fallback
 # coloring, used only when the bag has no oxts_msgs/msg/Ncom topic to decode
@@ -196,6 +206,27 @@ def asof_forward_fill(query_ts: np.ndarray, ref_ts: np.ndarray, ref_val: np.ndar
     return np.where(idx >= 0, ref_val[np.clip(idx, 0, len(ref_val) - 1)], fill_value)
 
 
+def time_tick_points(t_ns: np.ndarray, lat: np.ndarray, lon: np.ndarray, interval_s: float
+                      ) -> list[tuple[float, float, float]]:
+    """Return (elapsed_s, lat, lon) at every interval_s along the track,
+    measured from t_ns[0]. Uses the nearest available fix to each target
+    elapsed time. Skips elapsed_s == 0 (redundant with the "start" marker).
+    """
+    if len(t_ns) == 0 or interval_s <= 0:
+        return []
+    t0 = t_ns[0]
+    total_s = (t_ns[-1] - t0) / 1e9
+    points = []
+    k = 1
+    while k * interval_s <= total_s:
+        elapsed_s = k * interval_s
+        target_ns = t0 + int(elapsed_s * 1e9)
+        idx = min(np.searchsorted(t_ns, target_ns), len(t_ns) - 1)
+        points.append((elapsed_s, float(lat[idx]), float(lon[idx])))
+        k += 1
+    return points
+
+
 def latlon_to_enu(lat, lon, lat0, lon0):
     """Equirectangular approx local tangent-plane meters; fine at vehicle/parking-lot scale."""
     x = np.radians(lon - lon0) * WGS84_R * np.cos(np.radians(lat0))
@@ -274,7 +305,9 @@ def detect_speed_jumps(t_ns: np.ndarray, lat: np.ndarray, lon: np.ndarray,
 def plot_route(data: np.ndarray, status: np.ndarray, color_status: np.ndarray,
                 style_map: dict, legend_title: str, out_path: str, title: str,
                 require_fix: bool, cov_sigma: float, basemap: bool,
-                max_speed_mps: float) -> bool:
+                max_speed_mps: float, maneuver_events: list | None = None,
+                reduced_accuracy_note: str | None = None,
+                time_tick_interval_s: float = 30.0) -> bool:
     if len(data) == 0:
         print(f"  [skip] no data: {title}", file=sys.stderr)
         return False
@@ -331,12 +364,34 @@ def plot_route(data: np.ndarray, status: np.ndarray, color_status: np.ndarray,
     for s in sorted(set(st_color.tolist())):
         color, label = style_map.get(s, ("gray", f"value={s}"))
         m = st_color == s
-        ax.scatter(mx[m], my[m], c=color, s=6, label=label, zorder=4)
+        ax.scatter(mx[m], my[m], c=color, s=1, label=label, zorder=4)
 
     ax.scatter(mx[0], my[0], facecolor="none", edgecolor="blue", s=250, marker="*",
                linewidth=1.5, zorder=5, label="start")
     ax.scatter(mx[-1], my[-1], facecolor="none", edgecolor="blue", s=150, marker="X",
                linewidth=1.5, zorder=5, label="end")
+
+    if maneuver_events:
+        for maneuver_type, color, marker, marker_label in MANEUVER_MARKER_STYLE:
+            m = [e for e in maneuver_events if e[3] == maneuver_type]
+            if not m:
+                continue
+            ev_lat = np.array([e[1] for e in m])
+            ev_lon = np.array([e[2] for e in m])
+            ev_mx, ev_my = latlon_to_webmercator(ev_lat, ev_lon)
+            ax.scatter(ev_mx, ev_my, facecolor="none", edgecolor=color, s=180,
+                       marker=marker, linewidth=1.5, zorder=6, label=marker_label)
+
+    tick_points = time_tick_points(d[:, 0], lat, lon, time_tick_interval_s)
+    if tick_points:
+        tick_lat = np.array([p[1] for p in tick_points])
+        tick_lon = np.array([p[2] for p in tick_points])
+        tick_mx, tick_my = latlon_to_webmercator(tick_lat, tick_lon)
+        ax.scatter(tick_mx, tick_my, c="black", s=15, marker="+", linewidth=1.0,
+                   zorder=7, label=f"every {time_tick_interval_s:g}s")
+        for (elapsed_s, _, _), tx, ty in zip(tick_points, tick_mx, tick_my):
+            ax.annotate(f"{elapsed_s:g}s", (tx, ty), textcoords="offset points",
+                        xytext=(4, 4), fontsize=6, color="black")
 
     pad_x = 0.15 * max(np.ptp(mx), 1.0)
     pad_y = 0.15 * max(np.ptp(my), 1.0)
@@ -356,6 +411,8 @@ def plot_route(data: np.ndarray, status: np.ndarray, color_status: np.ndarray,
         jump_notes.append(f"0 Jump: {n_zero_jump} pts excluded (lat=lon=0)")
     if n_speed_jump > 0:
         jump_notes.append(f"Speed Jump: {n_speed_jump} pts excluded (> {max_speed_mps:g} m/s)")
+    if reduced_accuracy_note:
+        jump_notes.append(reduced_accuracy_note)
     if jump_notes:
         ax.text(0.02, 0.02, "\n".join(jump_notes),
                 transform=ax.transAxes, fontsize=9, color="red", va="bottom", ha="left",
@@ -409,6 +466,16 @@ def main(argv=None) -> int:
                           "(default: 50.0, i.e. 180 km/h); a point is excluded as a "
                           "'Speed Jump' only when the speed both into and out of it "
                           "exceeds this. Set to 0 to disable the check.")
+    ap.add_argument("--tag-maneuvers", action="store_true",
+                     help="detect lane-change maneuvers and mark them on the route map "
+                          "and in a CSV sidecar (opt-in; default off, no effect on "
+                          "existing output when omitted). Uses a sensor_msgs/msg/Imu "
+                          "topic if present, falling back to a lower-accuracy GPS-"
+                          "position-derivative estimate otherwise.")
+    ap.add_argument("--time-tick-interval", type=float, default=30.0,
+                     help="mark the route every N seconds elapsed from the start, "
+                          "with a small tick and the elapsed-time label (default: "
+                          "30.0). Set to 0 to disable.")
     args = ap.parse_args(argv)
 
     files = resolve_mcap_files(args.input)
@@ -441,6 +508,23 @@ def main(argv=None) -> int:
 
     base = input_basename(args.input)
 
+    # Maneuver tagging (opt-in): prefer a sensor_msgs/msg/Imu-schema topic
+    # (yaw rate + heading + longitudinal accel, already INS-computed) over
+    # the GPS-position-derivative fallback. Discovered once, like the Ncom
+    # topic above, since it doesn't depend on which NavSatFix topic is
+    # being plotted. Stop detection needs neither — it always runs directly
+    # off each topic's own GPS fixes, below.
+    imu_t_ns = imu_yaw_rate = imu_heading = imu_accel_x = None
+    if args.tag_maneuvers:
+        imu_topics = maneuver_detection.discover_imu_topics(files)
+        if imu_topics:
+            imu_t_ns, imu_yaw_rate, imu_heading, imu_accel_x = maneuver_detection.read_imu_signals(
+                files, imu_topics[0])
+            print(f"Imu topic: {imu_topics[0]} ({len(imu_t_ns)} samples decoded)")
+        else:
+            print(f"no {maneuver_detection.IMU_TYPE} topic found; falling back to "
+                  "GPS-position-derivative maneuver detection (reduced accuracy)")
+
     ok = 0
     for topic in topics:
         data, status = read_navsatfix(files, topic)
@@ -454,12 +538,37 @@ def main(argv=None) -> int:
         else:
             color_status, style_map, legend_title = status, STATUS_STYLE, "status.status (NavSatFix)"
 
+        mapped_events, reduced_accuracy_note = [], None
+        if args.tag_maneuvers:
+            fix_t_ns, fix_lat, fix_lon = data[:, 0], data[:, 1], data[:, 2]
+            if imu_t_ns is not None and len(imu_t_ns) > 0:
+                events = maneuver_detection.detect_lane_changes(imu_t_ns, imu_yaw_rate, imu_heading)
+                events += maneuver_detection.detect_harsh_accel_decel(imu_t_ns, imu_accel_x)
+            else:
+                reduced_accuracy_note = "Maneuver tags: reduced accuracy (no Imu topic; GPS-derived)"
+                yaw_rate, heading = maneuver_detection.derive_yaw_rate_heading_from_position(
+                    fix_t_ns, fix_lat, fix_lon)
+                events = maneuver_detection.detect_lane_changes(fix_t_ns, yaw_rate, heading)
+                accel_x = maneuver_detection.derive_accel_from_position(fix_t_ns, fix_lat, fix_lon)
+                events += maneuver_detection.detect_harsh_accel_decel(fix_t_ns, accel_x)
+            # Stop detection is always GPS-fix-based, independent of Imu availability.
+            events += maneuver_detection.detect_stops(fix_t_ns, fix_lat, fix_lon)
+            mapped_events = maneuver_detection.map_events_to_fixes(events, fix_t_ns, fix_lat, fix_lon)
+
+            csv_fname = (f"{base}_maneuvers.csv" if len(topics) == 1
+                         else f"{base}_{sanitize_topic(topic)}_maneuvers.csv")
+            csv_path = os.path.join(out_dir, csv_fname)
+            maneuver_detection.write_maneuver_events_csv(mapped_events, csv_path)
+            print(f"  wrote {csv_path}  ({len(mapped_events)} maneuver event(s))")
+
         fname = (f"{base}_gps-route.png" if len(topics) == 1
                  else f"{base}_{sanitize_topic(topic)}_gps-route.png")
         out_path = os.path.join(out_dir, fname)
         title = f"GPS route: {topic} ({len(data)} fixes)"
         if plot_route(data, status, color_status, style_map, legend_title, out_path, title,
-                       args.require_fix, args.cov_sigma, not args.no_basemap, args.max_speed):
+                       args.require_fix, args.cov_sigma, not args.no_basemap, args.max_speed,
+                       maneuver_events=mapped_events, reduced_accuracy_note=reduced_accuracy_note,
+                       time_tick_interval_s=args.time_tick_interval):
             print(f"  wrote {out_path}  ({len(data)} points)")
             ok += 1
 

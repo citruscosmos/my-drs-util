@@ -21,7 +21,7 @@ hardcoded topic name) and plots each one's GPS route as a PNG.
 
 ```bash
 python3 plot_gps_route.py <mcap-or-dir> [--out-dir OUT] [--topics t1,t2] \
-    [--require-fix] [--cov-sigma N] [--no-basemap] [--max-speed N]
+    [--require-fix] [--cov-sigma N] [--no-basemap] [--max-speed N] [--tag-maneuvers]
 ```
 
 | Argument | Required | Default | Description |
@@ -33,6 +33,7 @@ python3 plot_gps_route.py <mcap-or-dir> [--out-dir OUT] [--topics t1,t2] \
 | `--cov-sigma` | | `1.0` | Covariance corridor half-width, in multiples of the 1-sigma horizontal std dev (`sqrt(mean(cov_xx, cov_yy))`). `0` disables the corridor. |
 | `--no-basemap` | | off | Skip fetching the OpenStreetMap tile background (for offline use) |
 | `--max-speed` | | `50.0` | Max plausible implied speed in m/s between consecutive fixes (180 km/h). Points implying a faster speed are excluded as a "Speed Jump" (see below). `0` disables the check. |
+| `--tag-maneuvers` | | off | Detect lane-change maneuvers and mark them on the route map (magenta diamond) and in a `<input-basename>_maneuvers.csv` sidecar. Opt-in — no effect on existing output when omitted. See "Maneuver tagging" below. |
 
 One PNG is written per matched topic, named after the input so a keyword
 search over a directory of output PNGs tells you which bag/folder each route
@@ -117,6 +118,39 @@ python3 plot_gps_route.py recording.mcap --out-dir ./out --cov-sigma 2
 
 # Stricter speed-jump threshold (36 km/h) for slow-speed parking-lot tests
 python3 plot_gps_route.py recording.mcap --out-dir ./out --max-speed 10
+```
+
+## Maneuver tagging: `--tag-maneuvers`
+
+Detects lane-change maneuvers (the first of accel/decel, turn, and
+lane-change to be implemented) and marks each one with a magenta diamond on
+the route map, plus a `<input-basename>_maneuvers.csv` sidecar (`t_ns, lat,
+lon, maneuver_type, magnitude_rad_s`) so a report writer can filter/query
+events without re-watching the bag.
+
+**Detection source:** prefers a `sensor_msgs/msg/Imu`-schema topic (yaw rate
+from `angular_velocity.z`, heading from `orientation`) — schema-detected the
+same way `NavSatFix` is, no vehicle-specific ROS package required. Falls back
+to a GPS-position-derivative estimate (lower accuracy — double-differentiating
+noisy position fixes) when no `Imu`-schema topic is present in the bag; the
+map and CSV are both labeled with a reduced-accuracy note in that case.
+
+**Classifier:** a hand-rolled hysteresis threshold-crossing detector
+(`tools/gps-route/maneuver_detection.py`, numpy only — no `scipy` dependency)
+distinguishes a lane change (a brief yaw-rate pulse that returns to the
+original heading) from a sustained turn (large net heading change). The
+default thresholds are provisional — validate them against a bag with a
+known lane-change event before trusting the output on a new vehicle/ECU
+setup (see the design doc's "The Assignment").
+
+**Known limitation:** a lane change performed while the road itself is
+curving (a turn and a lane-change pulse superimposed on the same yaw-rate
+signal) is not reliably separated in v1 — see the `xfail`-marked test in
+`tests/test_maneuver_detection.py`.
+
+```bash
+# Tag lane changes, in addition to the usual route map
+python3 plot_gps_route.py recording.mcap --out-dir ./out --tag-maneuvers
 ```
 
 ## Batch processing: `batch_plot_gps_route.py`
