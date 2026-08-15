@@ -402,7 +402,20 @@ def plot_route(data: np.ndarray, status: np.ndarray, color_status: np.ndarray,
     if basemap:
         try:
             import contextily as ctx
-            ctx.add_basemap(ax, source=ctx.providers.OpenStreetMap.Mapnik)
+            # contextily's default User-Agent ("contextily-<uuid>") does not
+            # identify the requesting app and gets rejected by OSM's tile
+            # usage policy (returns a 403 "Access blocked" tile as a normal
+            # image, not an HTTP error) - send an identifying UA instead.
+            # (A generic browser-spoofing UA gets blocked too - it matches
+            # known scraper patterns - so this must stay a real identifying
+            # string, not a browser string.)
+            ctx.add_basemap(
+                ax,
+                source=ctx.providers.OpenStreetMap.Mapnik,
+                headers={
+                    "user-agent": "my-drs-util gps-route (https://github.com/citruscosmos/my-drs-util)"
+                },
+            )
         except Exception as e:
             print(f"  [warn] basemap fetch failed ({e}); plotting without it", file=sys.stderr)
 
