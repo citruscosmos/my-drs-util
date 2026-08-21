@@ -1,0 +1,54 @@
+# カテゴリ別のQA観点。運用者はここを直接編集してよい(コード変更不要、次回実行から反映される)。
+# categories: に無いカテゴリは default が使われる。
+
+default: |
+  - Check whether the annotated category label is correct for what is visible.
+  - Check whether the box/mask boundary tightly matches the object's visible extent.
+  - Flag any clearly visible instance of this category that has no annotation at all (missed detection).
+
+categories:
+  car: |
+    - Bounding box should tightly enclose the vehicle body including mirrors, excluding shadow/reflection.
+    - Flag duplicate boxes on the same vehicle.
+    - Flag vehicles clearly visible but with no annotation at all (missed detection), especially partially occluded or distant ones.
+    - Check the box is not obviously offset from the vehicle (misalignment).
+
+  truck: |
+    - Same criteria as car: tight box, no duplicates, no missed detections.
+    - Large vehicles are sometimes split into multiple boxes (cab vs trailer) — flag if this looks wrong.
+
+  pedestrian: |
+    - Box/mask should include the full body; check for cut-off limbs or heads.
+    - Partially occluded pedestrians (behind poles/vehicles) are easy to miss — check edges of frame and behind objects.
+    - Check that cyclists/motorcyclists are not mislabeled as pedestrian or vice versa.
+    - Groups of pedestrians close together are prone to missed or merged boxes — check each individual is separately boxed.
+
+  motorcycle: |
+    - Box should include rider(s) as part of the same instance if the dataset convention does so (assume yes unless clearly not).
+    - Check motorcycles are not confused with bicycles.
+
+  bicycle: |
+    - Check bicycles are not confused with motorcycles.
+    - Box should include rider if present.
+
+  traffic_light: |
+    - Box should cover the full housing, not just the lit lens.
+    - If an attribute encodes signal state (red/yellow/green), check it matches what's visible.
+    - Small/distant traffic lights are commonly missed — look carefully near the horizon and at intersections.
+
+  traffic_sign: |
+    - Box should tightly bound the sign face.
+    - Check for missed signs, especially small or partially occluded ones.
+
+  crosswalk: |
+    - Mask should follow the painted crosswalk stripes, not spill onto surrounding road surface.
+
+  laneline_solid_white: |
+    - Mask should follow the painted line, not the road surface around it.
+    - Check for gaps where a continuous line was not annotated.
+
+  road: |
+    - Mask should cover the drivable surface, excluding sidewalks/curbs.
+
+  sidewalk: |
+    - Mask should cover the pedestrian walkway, excluding the road surface.

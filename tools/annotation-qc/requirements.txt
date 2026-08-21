@@ -1,0 +1,14 @@
+# pip-installable dependencies for tools/annotation-qc/
+#
+# Install with:
+#   pip install -r requirements.txt
+
+numpy
+opencv-python
+pandas
+pyarrow
+pillow
+pycocotools
+pyyaml
+requests
+tqdm
