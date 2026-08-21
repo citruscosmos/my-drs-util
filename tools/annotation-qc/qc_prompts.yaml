@@ -33,8 +33,12 @@ categories:
 
   traffic_light: |
     - Box should cover the full housing, not just the lit lens.
-    - If an attribute encodes signal state (red/yellow/green), check it matches what's visible.
+    - The "state" attribute (red/green/yellow/none/pedestrian variants, arrow direction) must match what's visible — flag any mismatch as misclassification.
+    - "lit_frac" (fraction of the lens that appears lit) and "overexposed_frac" (fraction that's blown-out white) are pre-computed from the image, not your own visual estimate — use them as a cross-check. A "state" other than "none" with lit_frac near 0 suggests the light may actually be unlit/off despite the label; a high overexposed_frac means the color may be unreliable even if something is lit (could be misread as the wrong color, e.g. white-hot instead of red).
+    - When a crop shows multiple lights (compound signal head with several arrows/circles), check each one's own state/lit_frac/overexposed_frac separately — don't average or generalize across the group.
     - Small/distant traffic lights are commonly missed — look carefully near the horizon and at intersections.
+    - These crops are often tiny (sometimes under 50px) and upscaled for display — expect some blur, and don't penalize normal upscaling softness as an annotation defect.
+    - A "state=none" crop is deliberately a hard-negative training sample; it can legitimately show a *different*, unrelated lit signal elsewhere in the crop that is outside the drawn box. Only flag missed_detection if a light appears lit *within the box itself* while labeled none — a lit light visible but clearly outside the box is not a labeling error.
 
   traffic_sign: |
     - Box should tightly bound the sign face.

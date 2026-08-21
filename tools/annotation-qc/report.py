@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from llm_client import ChatClient
-from qc_schema import SYSTEM_PROMPT
+from qc_schema import SYSTEM_PROMPT as DEFAULT_SYSTEM_PROMPT
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -71,18 +71,24 @@ def parse_qc_response(text: str) -> tuple[dict | None, bool]:
     return None, False
 
 
-def query_with_retry(client: ChatClient, user_prompt: str, image_paths: list[str], max_tokens: int = 2048) -> tuple[dict, bool, str]:
+def query_with_retry(
+    client: ChatClient, user_prompt: str, image_paths: list[str], max_tokens: int = 2048,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+) -> tuple[dict, bool, str]:
     """LLMに問い合わせ、JSONが壊れていたら1回だけリトライ。それでも失敗したら合成フォールバック行を返す。
+
+    system_promptを差し替えれば、annotation QC以外の用途(例: 拡張・合成データの自然さチェック)
+    にもこの共通のリトライ/フォールバック機構をそのまま使える。
 
     戻り値: (parsed_dict, parse_ok, raw_text_of_last_response)
     """
-    raw = client.chat_vision(SYSTEM_PROMPT, user_prompt, image_paths, max_tokens=max_tokens)
+    raw = client.chat_vision(system_prompt, user_prompt, image_paths, max_tokens=max_tokens)
     parsed, ok = parse_qc_response(raw)
     if ok:
         return parsed, True, raw
 
     retry_prompt = user_prompt + "\n\nYour previous reply was not valid JSON. Reply with ONLY the JSON object."
-    raw2 = client.chat_vision(SYSTEM_PROMPT, retry_prompt, image_paths, max_tokens=max_tokens)
+    raw2 = client.chat_vision(system_prompt, retry_prompt, image_paths, max_tokens=max_tokens)
     parsed2, ok2 = parse_qc_response(raw2)
     if ok2:
         return parsed2, True, raw2

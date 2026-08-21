@@ -6,8 +6,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
+
+if TYPE_CHECKING:
+    from adapter_base import FrameRecord
 
 ISSUE_CATEGORIES = [
     "missed_detection",
@@ -59,7 +63,38 @@ def load_prompt_guidance(path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
-def build_user_prompt(clip_id: str, key: str, channel: str, target_categories: list[str], guidance: dict) -> str:
+def describe_frame_annotations(frame: "FrameRecord", channel: str, target_categories: list[str]) -> list[str]:
+    """そのフレーム(チャンネル)の現在のアノテーションを、属性値つきの短いテキストで列挙する。
+
+    attribute_names(例: lit_frac=0.05 のような品質指標)は画像への描画ラベルだけでは
+    伝わらないため、プロンプト本文にも明示的に含める。target_categoriesで絞り込む。
+    """
+    target_set = set(target_categories) if target_categories else None
+    lines = []
+    cam = frame.cameras.get(channel)
+    if cam is not None:
+        for b in cam.boxes2d:
+            if target_set is not None and b.category_name not in target_set:
+                continue
+            attrs = f" ({', '.join(b.attribute_names)})" if b.attribute_names else ""
+            lines.append(f"- 2D box: {b.category_name}{attrs}")
+        for m in cam.masks2d:
+            if target_set is not None and m.category_name not in target_set:
+                continue
+            attrs = f" ({', '.join(m.attribute_names)})" if m.attribute_names else ""
+            lines.append(f"- mask: {m.category_name}{attrs}")
+    for box in frame.boxes3d:
+        if target_set is not None and box.category_name not in target_set:
+            continue
+        attrs = f" ({', '.join(box.attribute_names)})" if box.attribute_names else ""
+        lines.append(f"- 3D box: {box.category_name}{attrs}")
+    return lines
+
+
+def build_user_prompt(
+    clip_id: str, key: str, channel: str, target_categories: list[str], guidance: dict,
+    annotation_lines: list[str] | None = None,
+) -> str:
     parts = [USER_PROMPT_HEADER.format(clip_id=clip_id, key=key, channel=channel)]
     default_text = guidance.get("default", "")
     categories_guidance = guidance.get("categories", {}) or {}
@@ -67,4 +102,9 @@ def build_user_prompt(clip_id: str, key: str, channel: str, target_categories: l
         text = categories_guidance.get(cat, default_text)
         if text:
             parts.append(f"\n### Focus: {cat}\n{text}")
+    if annotation_lines:
+        parts.append(
+            "\n### Current annotations in this frame (from the dataset, for reference)\n"
+            + "\n".join(annotation_lines)
+        )
     return "\n".join(parts)

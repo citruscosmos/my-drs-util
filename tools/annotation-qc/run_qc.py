@@ -22,15 +22,17 @@ from tqdm import tqdm
 
 from adapter_base import FrameRecord
 from llm_client import ChatClient
-from qc_schema import build_user_prompt, load_prompt_guidance
+from qc_schema import build_user_prompt, describe_frame_annotations, load_prompt_guidance
 from report import ReportWriter, query_with_retry
 from t4dataset_adapter import T4DatasetWebdatasetAdapter
+from tlr_crops_adapter import TLRCropsAdapter
 from viz2d import draw_bbox2d, draw_box3d_wireframe, draw_lidar_points, draw_mask_overlay
 
 SCRIPT_DIR = Path(__file__).parent
 
 ADAPTERS = {
     "t4dataset-webdataset": T4DatasetWebdatasetAdapter,
+    "tlr-crops": TLRCropsAdapter,
 }
 
 
@@ -59,6 +61,15 @@ def render_frame_channel(frame: FrameRecord, channel: str, args, target_categori
                 continue
             img = draw_bbox2d(img, box)
 
+    # 小さい画像(TLRクロップ等)はここで、全レイヤー描画が終わった後にアップスケールする。
+    # box/mask座標はネイティブ解像度基準のため、描画前に拡大すると座標とサイズが
+    # 食い違う(実データで確認済みのバグ)。拡大は必ず描画完了後に行うこと。
+    h, w = img.shape[:2]
+    short_side = min(h, w)
+    if short_side < args.min_display_size:
+        scale = args.min_display_size / short_side
+        img = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_CUBIC)
+
     out_dir = Path(args.out_dir) / "viz" / frame.clip_id
     out_dir.mkdir(parents=True, exist_ok=True)
     png_path = out_dir / f"{frame.key}.{channel.lower()}.png"
@@ -66,7 +77,7 @@ def render_frame_channel(frame: FrameRecord, channel: str, args, target_categori
     return png_path
 
 
-def process_one(frame: FrameRecord, channel: str, args, guidance: dict, requested_categories: list[str] | None):
+def process_one(frame: FrameRecord, channel: str, args, guidance: dict, requested_categories: list[str] | None, llm_base_url: str):
     present = frame.categories_present() | {b.category_name for b in frame.cameras[channel].boxes2d} | {m.category_name for m in frame.cameras[channel].masks2d}
     if requested_categories:
         target_categories = sorted(present & set(requested_categories))
@@ -82,8 +93,9 @@ def process_one(frame: FrameRecord, channel: str, args, guidance: dict, requeste
             "overall_notes": "", "parse_ok": None,
         }
 
-    client = ChatClient(args.llm_base_url, args.llm_model, args.llm_api_key_env)
-    user_prompt = build_user_prompt(frame.clip_id, frame.key, channel, target_categories, guidance)
+    client = ChatClient(llm_base_url, args.llm_model, args.llm_api_key_env)
+    annotation_lines = describe_frame_annotations(frame, channel, target_categories)
+    user_prompt = build_user_prompt(frame.clip_id, frame.key, channel, target_categories, guidance, annotation_lines)
     parsed, parse_ok, _raw = query_with_retry(client, user_prompt, [str(png_path)], max_tokens=args.llm_max_tokens)
     return {
         "clip_id": frame.clip_id, "frame_index": frame.frame_index, "key": frame.key, "channel": channel,
@@ -110,7 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-masks", action="store_true")
     ap.add_argument("--ann3d-frame", choices=["world", "ego"], default="world")
     ap.add_argument("--alpha", type=float, default=0.45)
-    ap.add_argument("--llm-base-url", default="http://localhost:11434/v1")
+    ap.add_argument("--min-display-size", type=int, default=320, help="合成画像の短辺がこれ未満なら描画完了後にアップスケールする(小さいTLRクロップ等向け)")
+    ap.add_argument("--llm-base-url", default="http://localhost:11434/v1", help="カンマ区切りで複数指定するとタスクをラウンドロビンで振り分ける(例: GPUごとに立てた複数インスタンス)")
     ap.add_argument("--llm-api-key-env", default=None)
     ap.add_argument("--llm-model", default="qwen3.8:27b")
     ap.add_argument("--llm-max-tokens", type=int, default=2048, help="対象カテゴリ数が多いフレームほど出力が長くなるため、必要なら増やす")
@@ -122,12 +135,13 @@ def main(argv: list[str] | None = None) -> int:
     adapter = ADAPTERS[args.adapter]()
     requested_categories = args.categories.split(",") if args.categories else None
     guidance = load_prompt_guidance(args.qc_prompts_file)
+    llm_endpoints = [u.strip() for u in args.llm_base_url.split(",") if u.strip()]
 
     clip_ids = args.clips.split(",") if args.clips else adapter.discover_clips(args.input)
     if not clip_ids:
         print(f"[qc] no clips found under {args.input}", file=sys.stderr)
         return 1
-    print(f"[qc] {len(clip_ids)} clip(s), jobs={args.jobs}, categories={requested_categories or 'all'}", flush=True)
+    print(f"[qc] {len(clip_ids)} clip(s), jobs={args.jobs}, categories={requested_categories or 'all'}, llm_endpoints={len(llm_endpoints)}", flush=True)
 
     writer = ReportWriter(Path(args.out_dir))
     tasks = []
@@ -147,12 +161,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[qc] {len(tasks)} (frame, channel) task(s) queued", flush=True)
 
     if args.jobs <= 1:
+        endpoint = llm_endpoints[0]
         for frame, channel in tqdm(tasks, unit="frame"):
-            row = process_one(frame, channel, args, guidance, requested_categories)
+            row = process_one(frame, channel, args, guidance, requested_categories, endpoint)
             writer.add(**row)
     else:
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            futures = [pool.submit(process_one, frame, channel, args, guidance, requested_categories) for frame, channel in tasks]
+            futures = [
+                pool.submit(process_one, frame, channel, args, guidance, requested_categories, llm_endpoints[i % len(llm_endpoints)])
+                for i, (frame, channel) in enumerate(tasks)
+            ]
             for future in tqdm(futures, unit="frame"):
                 row = future.result()
                 writer.add(**row)

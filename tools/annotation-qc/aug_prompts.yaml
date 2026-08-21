@@ -1,0 +1,43 @@
+# データ拡張・合成タグ別のQA観点。運用者はここを直接編集してよい(コード変更不要)。
+# tags: に無いタグは default が使われる。
+#
+# 各タグの意味は生成ログ(train_gen.log/val_gen.log)の設定値から確認したもの:
+#   Aug: random_crop=true (wider×2/narrower×2, expand=0.25/shrink=0.15),
+#        arrow_aug=true, color_aug=true, rot_step=1,
+#        whole_rot=true (max=90, step=15, dir=ccw), photo=2, lowres=true, flicker=true
+
+default: |
+  - Compare directly against the original image [1]; only flag something that is visibly different from what a real camera would produce.
+  - Do not flag normal, mild resizing/compression softness as a defect.
+
+tags:
+  whole_recolor: |
+    # "_whole_<color>_deg<NNN>": 灯火のレンズ全体を、実際に撮影された色から別の色(状態)へ
+    # 色相回転(hue rotation)によって完全に合成で塗り替えたもの。実際の点灯状態ではない。
+    - Check the new color looks like a plausible real lit lens of that color (correct hue, plausible glow/halo/bloom), not an oversaturated flat color patch or an obviously wrong intermediate hue.
+    - Check for a visible edge/seam where the recolored region meets the surrounding housing (a giveaway that the recolor mask didn't follow the lens shape).
+    - Check the glow/reflection on the housing around the lens was also updated consistently — a colored lens next to an unchanged glow of the *original* color is a defect.
+
+  flicker: |
+    # LED信号灯特有のPWM点滅により、1フレームだけ暗く/消灯して見える現象を模したもの。
+    - Should look like a plausible camera-shutter-vs-LED-PWM flicker artifact: partial or full dimming of the lens, but the lens housing/shape should remain intact and recognizable.
+    - Flag if the result looks like random noise/corruption rather than a dimmed light.
+
+  photometric: |
+    # "_ph00"/"_ph01": 明るさ・コントラスト・露出/色味のランダムなジッター(photo=2設定)。
+    - The jittered image should still look like a plausible photograph (natural exposure range), not posterized, clipped, or with an impossible color cast.
+    - Check the light's stated color is still visually distinguishable after the jitter — if the jitter pushed a "red" light to look convincingly green/other, flag it.
+
+  random_crop_narrow: |
+    # "_rcn00"/"_rcn01": 元の検出枠を約15%狭めた(shrink)クロップ(random_crop設定のnarrower側)。
+    - Check the traffic light lens(es) are still mostly visible; if the tighter crop cuts off the lit portion of the lens itself (not just the housing edge), that's a real problem for a training sample labeled with this state.
+
+  random_crop_wide: |
+    # "_rcw00"/"_rcw01": 元の検出枠を約25%広げた(expand)クロップ(random_crop設定のwider側)。
+    - Check the wider crop didn't accidentally pull in a second, different traffic light or signal that could make the single-label annotation ambiguous.
+
+  lowres: |
+    # "_lr00"〜"_lr03": 低解像度化(lowres=true設定)によるぼかし/解像度劣化と推定(生成ツールの
+    # ソースコードは未確認のため、正確な変換内容は推測)。
+    - Should look like plausible downsampling/blur (loss of fine detail, softened edges), not a corrupted or tiled/aliased pattern.
+    - If this guidance seems inconsistent with what you actually see, say so in overall_notes rather than guessing — the exact transformation behind this tag is not fully confirmed.
