@@ -1,0 +1,224 @@
+---
+name: drs-ingest
+description: End-to-end pipeline for a new jt10 recording group — detect the two USB SSDs (ecu0/ecu1, plugged into the fixed portA/portB slots), upload their raw data to jt10/<group>/{ecu0,ecu1} via Alluxio's S3 API with persistence verification, generate GPS route maps + maneuver tags from the uploaded ecu0 data, then run T4/NuScenes dataset conversion via rosbag-data-pipeline. Use when the operator says they've plugged in the two recording SSDs and want to ingest a new jt10 group, or asks to run the full USB-to-t4dataset pipeline.
+---
+
+# drs-ingest
+
+Chains three stages for one new jt10 recording group, triggered manually
+after an operator physically plugs in both USB SSDs:
+
+1. **Detect + upload** raw `ecu0`/`ecu1` data from the two USB SSDs to
+   `jt10/<group>/{ecu0,ecu1}` via Alluxio's S3 API, with persistence
+   verification and a permission fix — `tools/drs-ingest/detect_and_upload.py`.
+2. **GPS route generation** from the uploaded `ecu0` data — an ephemeral ROS2
+   container running `tools/gps-route`, wrapped by
+   `tools/drs-ingest/run_gps_route_ephemeral.sh`.
+3. **T4/NuScenes conversion** from `ecu0`+`ecu1` — a direct call into the
+   sibling repo's `rosbag-data-pipeline/python/run_batch_t4_pipeline.py`.
+
+Design notes (verified 2026-09-16, see this session's history for the raw
+investigation if anything below needs re-deriving):
+
+- `jt10` **is** reachable via Alluxio's S3 API (`s3://jt10/...`) even though
+  it does not appear in a plain `aws s3 ls` bucket listing (a display/cache
+  quirk of this deployment, not a real gap — addressing `s3://jt10/...`
+  directly works for both reads and writes). The worker container
+  `petadata-alluxio-worker-warm-1` bind-mounts the host's
+  `/mnt/DataPool/SharedData` (jt10's NFS export) at
+  `/opt/alluxio/underFSStorage` — S3 writes and direct-NFS writes land on
+  the exact same files, just via two access paths.
+- S3-written objects come back `root:root` / `rwxrwx---` (no "other"
+  access at all) — fixed via `docker exec petadata-alluxio-worker-warm-1
+  chmod -R o+rwX ...` (that container's root has no NFS root-squash issue; a
+  plain `shimaki`-user `chmod`/`rm` over the direct NFS path gets refused).
+  **Other-write, not just other-read**, is needed — every pre-existing jt10
+  group directory is `drwxrwxrwx`, and Stage 2's ephemeral (unprivileged)
+  container must be able to create new files under `gps-route/` without any
+  further root trick. `detect_and_upload.py` also pre-creates `gps-route/`
+  and `t4dataset/` (empty) at this step, both with this open permission, so
+  downstream stages never need to write into the (deliberately left
+  more-restrictive) `ecu0/`/`ecu1/` raw-data tree at all — confirmed
+  directly: `batch_plot_gps_route.py`'s default "write output alongside the
+  input" behavior gets a `PermissionError` there, which is why Stage 2 always
+  passes `--out-dir <group>/gps-route` instead (nests one level per
+  recording; `run_gps_route_ephemeral.sh` flattens it back to match every
+  other group's layout).
+  A chmod immediately after a *large* (multi-GB) upload can also be silently
+  lost — Alluxio's async persist-to-UFS finalization for a big file can still
+  be in flight for a few seconds after the S3 API reports the object present,
+  and a chmod racing that finalization gets clobbered when the finalization
+  completes (confirmed directly: reproducible on a 2.3GB test upload, not on
+  a 37-byte one). `fix_permissions()` retries+re-verifies (`find ... !
+  -perm -o+rw`) rather than firing the chmod once.
+- Alluxio only **discovers** a child entry that was created out-of-band
+  (`docker exec mkdir`, or Stage 2's direct-NFS-equivalent write into
+  `gps-route/`) once its **parent directory has itself been listed** — a
+  listing of the nested path alone can come back empty even though the files
+  are already on disk (confirmed directly: listing `.../gps-route/` before
+  ever listing the group root returned nothing; listing the group root first,
+  then retrying, fixed it immediately). `run_gps_route_ephemeral.sh`'s
+  verification step always lists the group root once before checking
+  `gps-route/`'s contents.
+- Whichever USB port a drive lands on is **not fixed** — `ecu0`/`ecu1` is
+  determined by scanning folder names after mount, not by port number.
+- Write-type safety: a sibling Alluxio proxy had a real data-loss incident
+  from `ASYNC_THROUGH` writes stuck un-persisted (fixed 2026-09-16). Since
+  the client can't force a write-type on this endpoint, Stage 1 always
+  verifies persistence by object-count after upload rather than trusting
+  the upload call's exit code alone — only recordings that verify are
+  reported safe to wipe the source SSD.
+- Only Stage 3 (T4 conversion) does a real "bring the full raw data
+  locally" step, and it's internal to `run_batch_t4_pipeline.py` itself
+  (unconditional `rsync`-to-`workspace/` staging when `--docker-container`
+  is used) — not duplicated by this skill. Stage 2 never stages a local
+  copy: `tools/gps-route` reads only a few narrow topics (NavSatFix/Imu/
+  Ncom) via mcap's indexed reader, not the full multi-GB payload — this was
+  empirically confirmed this session (a 93GB/27-file recording still
+  processed in the usual ~15-20s).
+- Stage 2 writes its PNG/CSV output directly to the jt10 NFS mount (not via
+  S3), so `run_gps_route_ephemeral.sh` explicitly re-verifies the result is
+  visible via the S3 API afterward (Alluxio's own UFS metadata sync was
+  confirmed to pick up direct-NFS writes within seconds in testing, but the
+  script checks rather than assumes).
+- Stage 3 relies on `run_batch_t4_pipeline.py`'s own lock file
+  (`workspace/.batch_pipeline.lock`) for mutual exclusion — do **not** add
+  a second lock. Another session may already be converting jt10 groups
+  (observed directly this session); an `exit(1)` from an already-held lock
+  means "did not run because another batch is active," not a failure.
+
+## Step 0 — Prerequisites and group naming
+
+```bash
+mount | grep /mnt/ssd
+```
+
+Both `/mnt/ssd/portA` and `/mnt/ssd/portB` should be listed as mounted
+(the existing `/etc/udev/rules.d/99-usb-ssd.rules` auto-mounts them on USB
+insertion). If a port isn't mounted, ask the operator to check the cable/
+insertion before proceeding — don't guess at partial data.
+
+Ask the operator for the recording date and a place/keyword, and form the
+group name following the existing convention (`<date>_jt10_<place>`, e.g.
+`20260916_jt10_example`). Confirm it doesn't already exist:
+
+```bash
+aws --endpoint-url http://127.0.0.1:39999/api/v1/s3 s3 ls s3://jt10/ --region us-east-1 \
+  --no-sign-request 2>/dev/null | grep <group> || echo "new group, OK to proceed"
+```
+
+(If it *does* exist, this is a resume — `detect_and_upload.py` skips
+recordings already uploaded+persisted, so it's safe to re-run.)
+
+## Step 1 — Detect and upload
+
+`cd` to this repo's root first — it's two levels above this skill file
+(`.claude/skills/drs-ingest/SKILL.md` → repo root), which the invocation
+already told you ("Base directory for this skill: .../my-drs-util/.claude/skills/drs-ingest"),
+so don't hardcode a path here; this repo can be cloned anywhere.
+
+```bash
+python3 tools/drs-ingest/detect_and_upload.py --group <group>
+```
+
+Add `--dry-run` first if you want to see what it *would* do without
+uploading anything. If only one of `ecu0`/`ecu1` is found, the script
+refuses by default — confirm with the operator whether to proceed with
+just that ECU (`--allow-partial`) or wait until both drives are correctly
+inserted.
+
+Report the per-ECU persisted/verified counts. Only tell the operator the
+SSD is safe to remove/wipe when the script's own final line says
+`SAFE TO WIPE: ...` — a `DO NOT WIPE: ...` line means some recordings
+didn't verify and the source data must be kept until resolved (re-run the
+script; it resumes from where it left off).
+
+This step can take a while for large groups (hundreds of GB to low TBs) —
+prefer running it in the background (`nohup ... > <scratchpad>/<group>_upload.log 2>&1 &`)
+and monitoring the log rather than blocking, same as the batch steps below.
+
+## Step 2 — GPS route generation
+
+```bash
+tools/drs-ingest/run_gps_route_ephemeral.sh /mnt/DataPool/SharedData/jt10/<group>
+```
+
+This spins up its own ephemeral ROS2 container (installs `mcap`/
+`mcap-ros2-support`/`contextily`/etc. into it, smoke-tests one recording to
+confirm the OSM basemap actually renders before committing to the full
+batch, then runs the batch with `--tag-maneuvers`), consolidates into a
+sibling `gps-route/` folder, and tears the container down when done. See
+[gps-route-batch-s3](../gps-route-batch-s3/SKILL.md) and
+[gps-route-batch](../gps-route-batch/SKILL.md) for background on the
+underlying tool and known failure patterns worth watching for in the
+script's output — in particular:
+
+- A `[warn] N basemap fetch failure(s)` line means some maps may have a
+  blank background; investigate before trusting the batch as complete.
+- The "GPS-quality flags" section lists any recording where nearly every
+  fix was excluded as a speed jump — this is a known data-quality pattern
+  (INS reporting a physically implausible fix, or a GPS cold-start at the
+  very start of a session) seen on several prior jt10 groups. Report these
+  to the operator individually; they are not a tool bug.
+
+Run this in the background for large groups (`nohup ... &`) and monitor
+with the `Monitor` tool, filtered to milestones/errors, the same way this
+session's manual gps-route runs were handled.
+
+## Step 3 — T4/NuScenes conversion
+
+This step needs the sibling `rosbag-data-pipeline` repo, which — unlike
+`my-drs-util` itself — has no equivalent "base directory" the invocation
+tells you. Locate it rather than assuming a fixed path: check
+`$ROSBAG_PIPELINE_REPO` first if set, then look for a `rosbag-data-pipeline`
+directory next to (a sibling of) this repo's own root, e.g.:
+
+```bash
+# REPO_ROOT = this repo's root, e.g. the skill invocation's own "Base
+# directory for this skill" two levels up (.claude/skills/drs-ingest/..)
+ROSBAG_PIPELINE_REPO="${ROSBAG_PIPELINE_REPO:-$(dirname "$REPO_ROOT")/rosbag-data-pipeline}"
+[ -d "$ROSBAG_PIPELINE_REPO/python" ] || { echo "rosbag-data-pipeline not found — ask the operator for its path" >&2; exit 1; }
+```
+
+If it isn't a sibling of `my-drs-util` on this host, ask the operator for
+its path rather than guessing further.
+
+```bash
+cd "$ROSBAG_PIPELINE_REPO"
+nohup python3 python/run_batch_t4_pipeline.py \
+  /mnt/DataPool/SharedData/jt10/<group> \
+  --convert-config config/convert_rosbag2_to_non_annotated_t4_fisheye_delay.yaml \
+  --duration 30 --process-mode balanced --merge-mode smart --min-overlap-sec 5 \
+  --driver auto --max-parallel 4 --docker-container rosbag-pipeline-dev \
+  > <scratchpad>/<group>_t4convert.log 2>&1 &
+disown
+```
+
+`root_dir` is pointed **directly at the new group's own path**, not its
+`jt10/` parent — `find_group_dirs()` starts scanning at `root_dir` itself,
+so this scopes the run to exactly this one group instead of rescanning all
+existing jt10 groups (confirmed against the script's source,
+`run_batch_t4_pipeline.py:77-96`). `--min-overlap-sec 5` must be passed
+explicitly — the script's own default (28) does not match this team's
+standard config (confirmed against
+`rosbag-data-pipeline/.claude/skills/t4-batch-convert/SKILL.md`).
+
+If this exits immediately with `sys.exit(1)` and a lock-related message,
+another batch (possibly from a different session) is already running —
+report this to the operator as "skipped, another conversion is already in
+progress," not as a failure; do not retry in a loop.
+
+Monitor with the `Monitor` tool filtered to
+`FAILED dataset|OK dataset PROCESSED|Batch run complete|Traceback|Error:|CRITICAL`
+(same filter `t4-batch-convert` uses). On completion, parse the
+`Batch run complete: processed=X failed=Y total=Z` line — the process exit
+code is 0 even when some datasets failed, so this line (or
+`pipeline_log/batch_t4_pipeline_status.json`) is the real signal.
+
+## Step 4 — Final report
+
+Summarize to the operator: recordings uploaded/persisted per ECU (and
+whether the SSDs are safe to wipe), gps-route PNG/CSV counts plus any
+basemap or GPS-quality flags, and the T4 conversion's processed/failed
+counts. Call out anything that needs follow-up explicitly rather than
+letting a partial failure blend into an otherwise-successful summary.
