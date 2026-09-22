@@ -25,6 +25,7 @@ t4dataset/ 空フォルダ作成まで行う。
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -112,6 +113,40 @@ def count_remote_files(s3_uri: str, endpoint_url: str, env: dict[str, str]) -> i
     if proc.returncode != 0:
         return 0
     return sum(1 for line in proc.stdout.splitlines() if line.strip())
+
+
+def abort_incomplete_multipart_uploads(bucket: str, prefix: str, endpoint_url: str, env: dict[str, str]) -> int:
+    """Abort any incomplete multipart uploads under `prefix` and return how many were aborted.
+
+    A `cp` killed mid-transfer (by `timeout`, or any other SIGTERM/SIGKILL) leaves its
+    in-flight multipart upload(s) uncompleted. This Alluxio S3 gateway deployment lists
+    an incomplete upload's already-received parts as if they were ordinary objects under
+    a `<filename>_<uploadid>/` pseudo-directory - `count_remote_files`'s plain `ls
+    --recursive` count picks these up, so a large recording that timed out with e.g. 24
+    real files done and 1 stuck mid-upload can show a remote object count *higher* than
+    the local file count (dozens of leftover 8MiB part entries for that one stuck file),
+    making `main()`'s "remote_count >= local_count" resume check wrongly conclude the
+    recording is fully persisted and skip re-uploading it (confirmed directly: a 100GB
+    recording with 9 of 25 files actually missing was reported "SAFE TO WIPE" before this
+    fix). Aborting here keeps every future count accurate; called both right after a
+    failed upload and once per --group at startup, in case a previous run was killed
+    outright rather than hitting its own `timeout` wrapper.
+    """
+    proc = subprocess.run(["timeout", "60s", "aws", "--endpoint-url", endpoint_url, "s3api",
+                            "list-multipart-uploads", "--bucket", bucket, "--prefix", prefix,
+                            "--region", "us-east-1", "--output", "json"],
+                           capture_output=True, text=True, env=env)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return 0
+    try:
+        uploads = json.loads(proc.stdout).get("Uploads") or []
+    except json.JSONDecodeError:
+        return 0
+    for u in uploads:
+        subprocess.run(["aws", "--endpoint-url", endpoint_url, "s3api", "abort-multipart-upload",
+                         "--bucket", bucket, "--key", u["Key"], "--upload-id", u["UploadId"],
+                         "--region", "us-east-1"], capture_output=True, text=True, env=env)
+    return len(uploads)
 
 
 def count_remote_files_retry(s3_uri: str, endpoint_url: str, env: dict[str, str], expected: int,
@@ -216,6 +251,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     env = s3_env(args.s3_access_key, args.s3_secret_key)
+
+    if not args.dry_run:
+        n_aborted = abort_incomplete_multipart_uploads(args.bucket, f"{args.group}/", args.s3_endpoint_url, env)
+        if n_aborted:
+            print(f"  [cleanup] aborted {n_aborted} incomplete multipart upload(s) left over from a prior run")
+
     report: dict[str, list[tuple[str, bool, int, int]]] = {}
 
     for ecu, (port_name, ecu_dir) in sorted(sources.items()):
@@ -243,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             ok = upload_recording(rec, s3_uri, args.s3_endpoint_url, env, args.transfer_timeout_sec)
             if not ok:
                 print(f"  [fail] upload failed: {rec.name}", file=sys.stderr)
+                abort_incomplete_multipart_uploads(args.bucket, f"{args.group}/{ecu}/{rec.name}/",
+                                                    args.s3_endpoint_url, env)
                 results.append((rec.name, False, 0, local_count))
                 continue
 

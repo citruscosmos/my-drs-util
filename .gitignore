@@ -42,3 +42,8 @@ proj_output/
 tools/auto-calib/docs/previous-method-result/
 tools/auto-calib/*.yaml
 tools/auto-calib/result*
+
+# alluxio-metadata-sync run state (progress files, logs) - machine-local,
+# not source
+tools/alluxio-metadata-sync/progress/
+tools/alluxio-metadata-sync/logs/
