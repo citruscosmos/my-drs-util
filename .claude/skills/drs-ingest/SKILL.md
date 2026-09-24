@@ -86,6 +86,27 @@ investigation if anything below needs re-deriving):
   a second lock. Another session may already be converting jt10 groups
   (observed directly this session); an `exit(1)` from an already-held lock
   means "did not run because another batch is active," not a failure.
+- Stage 1 always checks each mounted USB port's link speed before scanning
+  (`usb_link_speed_mbps()`, sysfs-based) and warns — non-fatally — if it's
+  below USB 3 (default threshold 5000 Mbps). Confirmed directly (2026-09-24):
+  two identical SSDs can differ by ~23x in real read throughput (43.6 MB/s
+  USB 2.0 vs 984 MB/s USB 3) purely from a port/cable link-speed difference
+  that mounting doesn't otherwise surface — a `[warn] portX is linked below
+  USB 3 speed` line means reseat the cable/port before a large upload, not
+  that anything failed.
+- Stage 1 also supports `--transfer-mode nfs` as an opt-in alternative to
+  the default `--transfer-mode s3`: writes directly to `--nas-root` via
+  rsync (same approach as Stage 3's tar+rsync copy-to-jt10) instead of
+  through Alluxio's S3 API. Measured ~3x faster (397 MB/s NFS-direct vs
+  138 MB/s through the S3 gateway on this deployment — the S3 gateway
+  itself is the bottleneck, not the NAS). Because this bypasses Alluxio's
+  own write path, it runs a one-time `alluxio fs loadMetadata -F
+  /<bucket>/<group>` at the end so the group becomes visible via the S3
+  API / to Stage 2 and 3 (same mechanism `run_batch_t4_pipeline.py` added
+  for its own tar+rsync mode). Combined with fixing a USB 2.0 link (see
+  above), a 2.1TB group's Stage 1 was measured/projected to drop from
+  ~12h27m to ~1h30m. Stays opt-in (default `s3`) until validated on a real
+  group in production — pass `--transfer-mode nfs` explicitly to use it.
 
 ## Step 0 — Prerequisites and group naming
 
@@ -126,6 +147,15 @@ uploading anything. If only one of `ecu0`/`ecu1` is found, the script
 refuses by default — confirm with the operator whether to proceed with
 just that ECU (`--allow-partial`) or wait until both drives are correctly
 inserted.
+
+The script always prints each port's USB link speed first and warns if
+either is below USB 3 — if you see `[warn] portX is linked below USB 3
+speed`, mention it to the operator (reseating the cable/port before a
+large upload avoids a much slower transfer) but proceed; it's a warning,
+not a blocker. For a large group, `--transfer-mode nfs` (opt-in, default
+is `s3`) uploads ~3x faster via direct rsync instead of the S3 API — offer
+it for large groups once it's been validated in production, but don't
+switch the default without being asked.
 
 Report the per-ECU persisted/verified counts. Only tell the operator the
 SSD is safe to remove/wipe when the script's own final line says
