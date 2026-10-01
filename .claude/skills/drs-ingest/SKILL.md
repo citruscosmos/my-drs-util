@@ -1,6 +1,6 @@
 ---
 name: drs-ingest
-description: End-to-end pipeline for a new jt10 recording group — detect the two USB SSDs (ecu0/ecu1, plugged into the fixed portA/portB slots), upload their raw data to jt10/<group>/{ecu0,ecu1} via Alluxio's S3 API with persistence verification, generate GPS route maps + maneuver tags from the uploaded ecu0 data, then run T4/NuScenes dataset conversion via rosbag-data-pipeline. Use when the operator says they've plugged in the two recording SSDs and want to ingest a new jt10 group, or asks to run the full USB-to-t4dataset pipeline.
+description: End-to-end pipeline for a new jt10 recording group — detect the two USB SSDs (ecu0/ecu1, plugged into the fixed portA/portB slots), convert them to a T4/NuScenes dataset in local chunks via rosbag-data-pipeline while uploading the raw data to jt10/<group>/{ecu0,ecu1} over NFS (size-verified, SAFE TO WIPE only when verified), and generate GPS route maps + maneuver tags straight from the SSD. Use when the operator says they've plugged in the two recording SSDs and want to ingest a new jt10 group, or asks to run the full USB-to-t4dataset pipeline.
 ---
 
 # drs-ingest
@@ -108,6 +108,65 @@ investigation if anything below needs re-deriving):
   ~12h27m to ~1h30m. Stays opt-in (default `s3`) until validated on a real
   group in production — pass `--transfer-mode nfs` explicitly to use it.
 
+## Ingest flow (default since 2026-10-01)
+
+Reading the multi-GB MCAPs back from the NAS over NFS is what made Stage 2/3 slow (Stage 2 dropped to
+~36MB/s; the NFS-written files show `0% in Alluxio`, so Alluxio's cache is not in that read path).
+The ingest flow therefore never reads raw data from the NAS: everything is read from the source SSDs
+(USB 3, ~1GB/s) or from a local copy, and the raw data is uploaded to the NAS in the background.
+
+1. **Prepare** — detect the SSDs, check link speed, create `<group>/{ecu0,ecu1,t4dataset,gps-route}`
+   on the NAS (root-owned parents need `docker exec`, done by the script):
+   ```bash
+   python3 tools/drs-ingest/detect_and_upload.py --group <group> --prepare-only
+   ```
+   It prints `INGEST_ECU0=...`, `INGEST_ECU1=...`, `INGEST_GROUP_DIR=...` for the next steps. Same
+   `[warn] portX is linked below USB 3 speed` handling as Stage 1 below.
+
+2. **Convert + upload raw (one process)** — `run_batch_t4_pipeline.py` in ingest mode (needs the sibling
+   `rosbag-data-pipeline` repo, located as in Step 3 below; this branch needs `feat/chunked-parallel-pipeline`
+   or later):
+   ```bash
+   cd "$ROSBAG_PIPELINE_REPO"
+   nohup python3 python/run_batch_t4_pipeline.py "$INGEST_GROUP_DIR" \
+     --ingest-ecu0 "$INGEST_ECU0" --ingest-ecu1 "$INGEST_ECU1" [--ingest-exclude-date YYYY-MM-DD ...] \
+     --convert-config config/convert_rosbag2_to_non_annotated_t4_fisheye_delay.yaml \
+     --duration 30 --process-mode balanced --merge-mode smart --min-overlap-sec 5 \
+     --driver auto --max-parallel 4 --docker-container rosbag-pipeline-dev \
+     --output-format tar --alluxio-worker-container petadata-alluxio-worker-warm-1 \
+     > <scratchpad>/<group>_ingest.log 2>&1 &
+   ```
+   Per chunk (default 10 ECU0 files, 2 chunks in parallel, 600GB local budget): copy from the SSD to the
+   local workspace -> merge/decode/convert from the local copy while the chunk's raw files upload to
+   `<group>/{ecu0,ecu1}/` in the background -> (after the raw upload is size-verified) copy the converted
+   segments to `t4dataset/`. The log says whether each chunk's raw upload was hidden behind processing.
+   Failure/exit semantics are those of Step 3 (lock file, `Batch run complete: processed=X failed=Y`).
+   `--output-format tar` is recommended: the converted segment copy of ~3800 small files per segment is
+   otherwise the slow step; consumers of the dataset must read the tar shards.
+
+   At the end it re-verifies **every** raw file of the SSD against the NAS by size (also MCAPs skipped as
+   unreadable and recordings without an ecu0/ecu1 partner), repairs what is missing, fixes permissions
+   (`chmod -R o+rwX` as root in the Alluxio worker container), syncs Alluxio metadata, and prints
+   `SAFE TO WIPE: ...` or `DO NOT WIPE: ...`. **The SSDs must stay plugged in until that line appears.**
+   Recordings excluded with `--ingest-exclude-date` are not uploaded (the script warns).
+
+3. **GPS routes, from the SSD** — can run at the same time as step 2 (they share the SSD's read bandwidth):
+   ```bash
+   tools/drs-ingest/run_gps_route_ephemeral.sh "$INGEST_GROUP_DIR" --ecu0-dir "$INGEST_ECU0" \
+     [--exclude-date YYYY-MM-DD ...]
+   ```
+   Same warnings as Step 2 below (basemap failures, GPS-quality flags).
+
+4. **Final report** as in Step 4 below, taking `SAFE TO WIPE` from step 2.
+
+Known issues worth reporting: an MCAP without a summary section (a recording that was never finalized — the
+pipeline skips it with a warning, and Stage 2's gps-route fails on that recording); the converter
+occasionally emits segments with broken prev/next links (the pipeline validates and re-runs convert up to
+`--convert-retries` times, and fails the chunk rather than copying a bad segment).
+
+The sections below describe the previous flow (upload to the NAS first, then process from the NAS). Use it
+only for an upload-only run or when the ingest flow cannot be used.
+
 ## Step 0 — Prerequisites and group naming
 
 ```bash
@@ -131,7 +190,7 @@ aws --endpoint-url http://127.0.0.1:39999/api/v1/s3 s3 ls s3://jt10/ --region us
 (If it *does* exist, this is a resume — `detect_and_upload.py` skips
 recordings already uploaded+persisted, so it's safe to re-run.)
 
-## Step 1 — Detect and upload
+## Step 1 (legacy flow) — Detect and upload
 
 `cd` to this repo's root first — it's two levels above this skill file
 (`.claude/skills/drs-ingest/SKILL.md` → repo root), which the invocation
@@ -167,7 +226,7 @@ This step can take a while for large groups (hundreds of GB to low TBs) —
 prefer running it in the background (`nohup ... > <scratchpad>/<group>_upload.log 2>&1 &`)
 and monitoring the log rather than blocking, same as the batch steps below.
 
-## Step 2 — GPS route generation
+## Step 2 — GPS route generation (legacy flow reads the NAS; the ingest flow reads the SSD)
 
 ```bash
 tools/drs-ingest/run_gps_route_ephemeral.sh /mnt/DataPool/SharedData/jt10/<group>
@@ -195,7 +254,7 @@ Run this in the background for large groups (`nohup ... &`) and monitor
 with the `Monitor` tool, filtered to milestones/errors, the same way this
 session's manual gps-route runs were handled.
 
-## Step 3 — T4/NuScenes conversion
+## Step 3 — T4/NuScenes conversion (legacy flow: whole-dataset or `--chunk-files N` from the NAS)
 
 This step needs the sibling `rosbag-data-pipeline` repo, which — unlike
 `my-drs-util` itself — has no equivalent "base directory" the invocation

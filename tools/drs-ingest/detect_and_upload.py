@@ -396,6 +396,15 @@ def main(argv: list[str] | None = None) -> int:
                           "Mbps - default 5000 (USB 3.0); USB 2.0 links at 480")
     ap.add_argument("--allow-partial", action="store_true",
                      help="Proceed even if only one of ecu0/ecu1 was found (default: refuse)")
+    ap.add_argument("--exclude-date", action="append", default=[], metavar="YYYY-MM-DD",
+                     help="Skip recordings whose folder name contains this date (repeatable, "
+                          "e.g. 2026-09-10). Skipped recordings are NOT uploaded, so their "
+                          "source SSD is not safe to wipe")
+    ap.add_argument("--prepare-only", action="store_true",
+                     help="Detect the SSDs and create the group's ecu0/ecu1/t4dataset/gps-route dirs on the NAS "
+                          "(root-owned parents need docker exec), print INGEST_ECU0/INGEST_ECU1/INGEST_GROUP_DIR for "
+                          "run_batch_t4_pipeline.py --ingest-ecu0/--ingest-ecu1, and upload nothing. This is the "
+                          "start of the ingest flow in which the T4 batch pipeline uploads the raw data itself")
     ap.add_argument("--dry-run", action="store_true", help="Only scan and report; upload nothing")
     args = ap.parse_args(argv)
 
@@ -418,6 +427,22 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 1
 
+    if args.prepare_only:
+        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.group}"
+        subdirs = [f"{group_ufs_path}/{d}" for d in ("ecu0", "ecu1", "t4dataset", "gps-route")]
+        if not args.dry_run:
+            ok = docker_exec(args.alluxio_worker_container, "mkdir", "-p", *subdirs)
+            ok = docker_exec(args.alluxio_worker_container, "chmod", "o+rwX", group_ufs_path, *subdirs) and ok
+            if not ok:
+                print("  [error] could not create/chmod the group dirs on the NAS", file=sys.stderr)
+                return 1
+        print(f"\n{'[dry-run] would prepare' if args.dry_run else 'Prepared'} {args.nas_root / args.bucket / args.group}")
+        for ecu in ECU_NAMES:
+            if ecu in sources:
+                print(f"INGEST_{ecu.upper()}={sources[ecu][1]}")
+        print(f"INGEST_GROUP_DIR={args.nas_root / args.bucket / args.group}")
+        return 0
+
     env = s3_env(args.s3_access_key, args.s3_secret_key)
 
     if not args.dry_run and args.transfer_mode == "s3":
@@ -438,10 +463,15 @@ def main(argv: list[str] | None = None) -> int:
         docker_exec(args.alluxio_worker_container, "chmod", "o+rwX", group_ufs_path, *ecu_ufs_paths)
 
     report: dict[str, list[tuple[str, bool, int, int]]] = {}
+    n_excluded = 0
 
     for ecu, (port_name, ecu_dir) in sorted(sources.items()):
         recordings = sorted(p for p in ecu_dir.iterdir() if p.is_dir())
-        print(f"\n{ecu} ({port_name}): {len(recordings)} recording(s)")
+        excluded = [p for p in recordings if any(d in p.name for d in args.exclude_date)]
+        recordings = [p for p in recordings if p not in excluded]
+        n_excluded += len(excluded)
+        print(f"\n{ecu} ({port_name}): {len(recordings)} recording(s)"
+              + (f" ({len(excluded)} excluded by --exclude-date)" if excluded else ""))
         results: list[tuple[str, bool, int, int]] = []
         for rec in recordings:
             local_count = count_local_files(rec)
@@ -533,6 +563,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if all_ok and safe_ports:
         print(f"\nSAFE TO WIPE: {', '.join(safe_ports)}")
+        if n_excluded:
+            print(f"  NOTE: {n_excluded} recording(s) were excluded by --exclude-date and were NOT "
+                  "uploaded - wiping the SSD would lose them")
         return 0
     print("\nDO NOT WIPE: one or more recordings are not fully verified - see [unverified] lines above")
     return 1

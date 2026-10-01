@@ -10,7 +10,13 @@
 # Alluxio's own UFS metadata sync is what other tools/hosts will see.
 #
 # Usage:
-#   run_gps_route_ephemeral.sh <group_path> [-- <plot_gps_route.py extra args>]
+#   run_gps_route_ephemeral.sh <group_path> [--ecu0-dir <dir>] [--exclude-date YYYY-MM-DD ...]
+#                              [-- <plot_gps_route.py extra args>]
+#
+# --ecu0-dir reads the recordings from there instead of <group_path>/ecu0 - the ingest flow points
+# it at the source SSD's ecu0 dir (USB 3, local) rather than the NAS, since reading the multi-GB
+# MCAPs over NFS was measured at ~36MB/s. Output still goes to <group_path>/gps-route/.
+# --exclude-date (repeatable) skips recording folders whose name contains that date.
 #
 # <group_path> is the jt10 group directory itself, e.g.
 #   /mnt/DataPool/SharedData/jt10/20260916_jt10_example
@@ -29,6 +35,15 @@ if [ $# -lt 1 ]; then
 fi
 GROUP_PATH="$(realpath "$1")"
 shift
+ECU0_SRC=""
+EXCLUDES=()
+while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+  case "$1" in
+    --ecu0-dir) ECU0_SRC="$(realpath "$2")"; shift 2 ;;
+    --exclude-date) EXCLUDES+=("$2"); shift 2 ;;
+    *) echo "[error] unknown option: $1" >&2; exit 2 ;;
+  esac
+done
 EXTRA_ARGS=()
 if [ "${1:-}" = "--" ]; then
   shift
@@ -36,7 +51,7 @@ if [ "${1:-}" = "--" ]; then
 fi
 
 GROUP_NAME="$(basename "$GROUP_PATH")"
-ECU0_DIR="$GROUP_PATH/ecu0"
+ECU0_DIR="${ECU0_SRC:-$GROUP_PATH/ecu0}"
 DEST_DIR="$GROUP_PATH/gps-route"
 # Derived from this script's own location (tools/drs-ingest/<this file>), not
 # hardcoded - works regardless of where this repo happens to be cloned.
@@ -45,7 +60,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TOOLS_DIR="$REPO_ROOT/tools/gps-route"
 
 if [ ! -d "$ECU0_DIR" ]; then
-  echo "[error] no ecu0/ under $GROUP_PATH" >&2
+  echo "[error] no ecu0 dir at $ECU0_DIR" >&2
   exit 1
 fi
 
@@ -58,10 +73,29 @@ echo "[1/6] starting ephemeral container $CONTAINER"
 # repo - both at identical absolute paths, so paths used on the host and
 # inside the container match regardless of where the jt10 mount or this repo
 # actually live on this particular host.
+MOUNT_SRC=()
+[ -n "$ECU0_SRC" ] && MOUNT_SRC=(-v "$ECU0_SRC:$ECU0_SRC:ro")
 docker run -dit --name "$CONTAINER" \
   -v "$GROUP_PATH:$GROUP_PATH" \
+  "${MOUNT_SRC[@]}" \
   -v "$REPO_ROOT:$REPO_ROOT" \
   "$IMAGE" bash >/dev/null
+
+# Recordings to process: all of ECU0_DIR, or - with --ecu0-dir/--exclude-date - a directory of
+# symlinks to the selected ones (created inside the container, so the host stays untouched).
+RUN_DIR="$ECU0_DIR"
+if [ -n "$ECU0_SRC" ] || [ ${#EXCLUDES[@]} -gt 0 ]; then
+  RUN_DIR=/tmp/ecu0_selected
+  docker exec "$CONTAINER" bash -c '
+    run_dir="$1"; src="$2"; shift 2
+    mkdir -p "$run_dir"
+    for d in "$src"/*/; do
+      [ -d "$d" ] || continue   # unmatched glob / dangling symlink (e.g. a source dir that is not mounted)
+      n="$(basename "$d")"; skip=0
+      for x in "$@"; do case "$n" in *"$x"*) skip=1 ;; esac; done
+      [ "$skip" = 0 ] && ln -s "${d%/}" "$run_dir/$n"
+    done' _ "$RUN_DIR" "$ECU0_DIR" "${EXCLUDES[@]}"
+fi
 
 echo "[2/6] installing gps-route python deps"
 docker exec "$CONTAINER" bash -c \
@@ -69,15 +103,15 @@ docker exec "$CONTAINER" bash -c \
   || { echo "[error] pip install failed" >&2; exit 1; }
 
 echo "[3/6] smoke-testing one recording (confirms OSM basemap actually renders)"
-FIRST_REC="$(ls "$ECU0_DIR" | head -1)"
+FIRST_REC="$(docker exec "$CONTAINER" ls "$RUN_DIR" | head -1)"
 if [ -z "$FIRST_REC" ]; then
-  echo "[error] $ECU0_DIR has no recordings" >&2
+  echo "[error] $RUN_DIR has no recordings" >&2
   exit 1
 fi
 SMOKE_LOG="$(mktemp)"
 docker exec -w "$TOOLS_DIR" "$CONTAINER" bash -c \
   "source /opt/ros/humble/setup.bash && python3 plot_gps_route.py \
-   '$ECU0_DIR/$FIRST_REC' --out-dir /tmp/smoketest --tag-maneuvers" \
+   '$RUN_DIR/$FIRST_REC' --out-dir /tmp/smoketest --tag-maneuvers" \
   > "$SMOKE_LOG" 2>&1
 if grep -q "basemap fetch failed" "$SMOKE_LOG"; then
   echo "[error] basemap fetch failed on smoke test - aborting before the full batch:" >&2
@@ -92,7 +126,7 @@ fi
 echo "  smoke test OK ($FIRST_REC)"
 rm -f "$SMOKE_LOG"
 
-echo "[4/6] running full batch over $ECU0_DIR"
+echo "[4/6] running full batch over $ECU0_DIR (${RUN_DIR})"
 # ecu0/ came from an S3 upload and is not writable by this (unprivileged)
 # container, so plot_gps_route.py's default "write alongside the input"
 # behavior would fail - write to gps-route/ directly via --out-dir instead
@@ -102,7 +136,7 @@ mkdir -p "$DEST_DIR" 2>/dev/null || true
 BATCH_LOG="$(mktemp)"
 docker exec -w "$TOOLS_DIR" "$CONTAINER" bash -c \
   "source /opt/ros/humble/setup.bash && python3 batch_plot_gps_route.py \
-   '$ECU0_DIR' --out-dir '$DEST_DIR' -- --tag-maneuvers ${EXTRA_ARGS[*]}" \
+   '$RUN_DIR' --out-dir '$DEST_DIR' -- --tag-maneuvers ${EXTRA_ARGS[*]}" \
   > "$BATCH_LOG" 2>&1
 tail -5 "$BATCH_LOG"
 
