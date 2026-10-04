@@ -159,6 +159,14 @@ The ingest flow therefore never reads raw data from the NAS: everything is read 
 
 4. **Final report** as in Step 4 below, taking `SAFE TO WIPE` from step 2.
 
+Token collisions: the converter also occasionally gives two records the same token (sample_data.json: broken
+prev/next links; ego_pose.json: two frames resolve to the same pose) or writes a number-like token without
+quotes (invalid JSON). The pipeline's pre-copy gate catches duplicates and re-converts; for data that is
+already on the NAS use `python/scan_t4_links.py <root> --check-files --out report.json` (read-only) and
+`python/repair_t4_tokens.py` (dry-run by default; `--apply --backup-dir ... --root-container
+petadata-alluxio-worker-warm-1` repairs in place with backups, atomically, keeping owner/mode) in the
+rosbag-data-pipeline repo. 2026-10-04: all of jt10 was repaired this way (269 segments).
+
 Known issues worth reporting: an MCAP without a summary section (a recording that was never finalized — the
 pipeline skips it with a warning, and Stage 2's gps-route fails on that recording); the converter
 occasionally emits segments with broken prev/next links (the pipeline validates and re-runs convert up to
