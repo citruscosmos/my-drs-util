@@ -42,7 +42,7 @@ host.
   | S3 endpoint URL | `http://127.0.0.1:39999/api/v1/s3` | Alluxio S3 API endpoint |
   | Access key | `root` | **Must be a real Unix username inside the Alluxio worker container** — Alluxio uses it directly as the UFS chown target for the written file; a made-up value (e.g. a project name) silently breaks every large-file (multipart) upload with `AccessDenied`, while small files tolerate it — so this only shows up once real recording data is involved. Check via `docker exec <alluxio-worker-container> cat /etc/passwd` if unsure; `root` reliably exists. |
   | Secret key | any non-empty string | Not verified by Alluxio |
-  | Target group's `ecu0` S3 path | `s3://jt10/<group>/ecu0` | The path segment right after `s3://` is the bucket (Alluxio maps each top-level FUSE dir 1:1 to a bucket); the rest is the key. Ask the user for the full path if not given — don't guess the group name. |
+  | Target group's `ecu0` S3 path | `s3://raw/jt10/<group>/ecu0` (bucket `raw`, key `<vehicle>/<group>/ecu0`; before 2026-10-05 it was `s3://jt10/<group>/ecu0`) | The path segment right after `s3://` is the bucket (Alluxio maps each top-level FUSE dir 1:1 to a bucket); the rest is the key. Ask the user for the full path if not given — don't guess the group name. |
   | FUSE mount root (optional) | `/home/shimaki/peta-data/.data/alluxio-mount` | Only needed for the permission fix in step 4 — a POSIX path onto the *same* Alluxio namespace as the S3 endpoint above. If unavailable on this host, skip step 4's `chmod` and tell the user the uploaded files may be unreadable to other users until someone with FUSE access runs it. |
 
 **Bash tool calls in this session do not share shell state** (env vars,

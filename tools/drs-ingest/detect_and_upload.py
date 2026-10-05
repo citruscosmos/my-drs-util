@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""USB SSD(portA/portB)から ecu0/ecu1 フォルダを検出し、jt10/<group>/{ecu0,ecu1}/
-へアップロードする(`--transfer-mode` で S3 API 経由 / NFS直接書き込みを選択)。
+"""USB SSD(portA/portB)から ecu0/ecu1 フォルダを検出し、raw/<vehicle>/<group>/{ecu0,ecu1}/
+(<vehicle> は既定で jt10)へアップロードする(`--transfer-mode` で S3 API 経由 / NFS直接書き込みを選択)。
 アップロード後は件数突き合わせで永続化を検証し、Alluxioワーカーコンテナ内で
-root権限のpermission修正とt4dataset/gps-route空フォルダ作成まで行う。
+root権限のpermission修正とgps-route空フォルダ作成まで行う。
+(変換後のデータセットは datasets/<group>/ に作られる。t4dataset/ は作らない)
 
 前提(2026-09-16 実地検証済み):
-- jt10 の Alluxio S3 API での bucket 名は "jt10"。`aws s3 ls`(バケット一覧)には
-  表示されないが、`s3://jt10/...` を直接アドレスすれば読み書きとも正常動作する。
+- 生データの Alluxio S3 API での bucket 名は "raw"(2026-10-05 以降。以前は車両ごとに "jt10" など)。
+  オブジェクトは `s3://raw/<vehicle>/<group>/...`。`aws s3 ls`(バケット一覧)には表示されない
+  ことがあるが、`s3://raw/...` を直接アドレスすれば動作する。
 - S3 PUT で書き込まれたオブジェクトは root:root 所有・rwxrwx--- (otherは無権限)に
   なるため、`docker exec <alluxio-worker-container>` でroot権限のまま
   chmod -R o+rwX / mkdir する必要がある(NFS越しにshimakiユーザーが直接操作すると
@@ -287,10 +289,11 @@ def fix_permissions(container: str, group_path: str, attempts: int = 5, delay_s:
 
     Grants "other" read+write (not just read) to match the permissive mode
     every pre-existing jt10 group directory already has (confirmed: every
-    group's ecu0/ecu1/gps-route/t4dataset observed this session is
-    drwxrwxrwx) - downstream tools (gps-route, t4dataset conversion) run as
-    an unprivileged container user and need to write into gps-route/ and
-    t4dataset/ without any further root/docker-exec trick.
+    group's ecu0/ecu1/gps-route observed this session is
+    drwxrwxrwx) - downstream tools (gps-route) run as an unprivileged
+    container user and need to write into gps-route/ without any further
+    root/docker-exec trick. (The converted dataset no longer lives in the
+    group dir: the pipeline writes datasets/<group>/ itself.)
 
     A just-uploaded large file can still be mid-finalization by Alluxio's
     async persist job for a few seconds after the S3 API reports it present -
@@ -371,7 +374,10 @@ def main(argv: list[str] | None = None) -> int:
                      help="jt10 group name to upload into, e.g. 20260916_jt10_example")
     ap.add_argument("--port-a", default="/mnt/ssd/portA", type=Path)
     ap.add_argument("--port-b", default="/mnt/ssd/portB", type=Path)
-    ap.add_argument("--bucket", default="jt10")
+    ap.add_argument("--bucket", default="raw",
+                     help="Top-level NAS dir = Alluxio S3 bucket holding the raw data (default: raw)")
+    ap.add_argument("--vehicle", default="jt10",
+                     help="Vehicle dir under the bucket: raw data goes to <bucket>/<vehicle>/<group>/{ecu0,ecu1}")
     ap.add_argument("--transfer-mode", choices=["s3", "nfs"], default="s3",
                      help="'s3' (default): upload via Alluxio's S3 API, as before. "
                           "'nfs': write directly to --nas-root via rsync, same approach as "
@@ -401,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
                           "e.g. 2026-09-10). Skipped recordings are NOT uploaded, so their "
                           "source SSD is not safe to wipe")
     ap.add_argument("--prepare-only", action="store_true",
-                     help="Detect the SSDs and create the group's ecu0/ecu1/t4dataset/gps-route dirs on the NAS "
+                     help="Detect the SSDs and create the group's ecu0/ecu1/gps-route dirs on the NAS "
                           "(root-owned parents need docker exec), print INGEST_ECU0/INGEST_ECU1/INGEST_GROUP_DIR for "
                           "run_batch_t4_pipeline.py --ingest-ecu0/--ingest-ecu1, and upload nothing. This is the "
                           "start of the ingest flow in which the T4 batch pipeline uploads the raw data itself")
@@ -428,25 +434,25 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if args.prepare_only:
-        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.group}"
-        subdirs = [f"{group_ufs_path}/{d}" for d in ("ecu0", "ecu1", "t4dataset", "gps-route")]
+        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.vehicle}/{args.group}"
+        subdirs = [f"{group_ufs_path}/{d}" for d in ("ecu0", "ecu1", "gps-route")]
         if not args.dry_run:
             ok = docker_exec(args.alluxio_worker_container, "mkdir", "-p", *subdirs)
             ok = docker_exec(args.alluxio_worker_container, "chmod", "o+rwX", group_ufs_path, *subdirs) and ok
             if not ok:
                 print("  [error] could not create/chmod the group dirs on the NAS", file=sys.stderr)
                 return 1
-        print(f"\n{'[dry-run] would prepare' if args.dry_run else 'Prepared'} {args.nas_root / args.bucket / args.group}")
+        print(f"\n{'[dry-run] would prepare' if args.dry_run else 'Prepared'} {args.nas_root / args.bucket / args.vehicle / args.group}")
         for ecu in ECU_NAMES:
             if ecu in sources:
                 print(f"INGEST_{ecu.upper()}={sources[ecu][1]}")
-        print(f"INGEST_GROUP_DIR={args.nas_root / args.bucket / args.group}")
+        print(f"INGEST_GROUP_DIR={args.nas_root / args.bucket / args.vehicle / args.group}")
         return 0
 
     env = s3_env(args.s3_access_key, args.s3_secret_key)
 
     if not args.dry_run and args.transfer_mode == "s3":
-        n_aborted = abort_incomplete_multipart_uploads(args.bucket, f"{args.group}/", args.s3_endpoint_url, env)
+        n_aborted = abort_incomplete_multipart_uploads(args.bucket, f"{args.vehicle}/{args.group}/", args.s3_endpoint_url, env)
         if n_aborted:
             print(f"  [cleanup] aborted {n_aborted} incomplete multipart upload(s) left over from a prior run")
 
@@ -457,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         # fix at the end. Non-recursive and cheap even on a resume: it only
         # needs to make these two directories exist and be writable, not
         # touch anything already underneath them.
-        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.group}"
+        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.vehicle}/{args.group}"
         ecu_ufs_paths = [f"{group_ufs_path}/{ecu}" for ecu in sources]
         docker_exec(args.alluxio_worker_container, "mkdir", "-p", *ecu_ufs_paths)
         docker_exec(args.alluxio_worker_container, "chmod", "o+rwX", group_ufs_path, *ecu_ufs_paths)
@@ -480,10 +486,10 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             if args.transfer_mode == "nfs":
-                dest = nfs_ecu_dir(args.nas_root, args.bucket, args.group, ecu) / rec.name
+                dest = nfs_ecu_dir(args.nas_root, args.bucket, f"{args.vehicle}/{args.group}", ecu) / rec.name
                 dest_desc = str(dest)
             else:
-                dest = f"s3://{args.bucket}/{args.group}/{ecu}/{rec.name}"
+                dest = f"s3://{args.bucket}/{args.vehicle}/{args.group}/{ecu}/{rec.name}"
                 dest_desc = dest
 
             if args.dry_run:
@@ -507,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
             if not ok:
                 print(f"  [fail] upload failed: {rec.name}", file=sys.stderr)
                 if args.transfer_mode == "s3":
-                    abort_incomplete_multipart_uploads(args.bucket, f"{args.group}/{ecu}/{rec.name}/",
+                    abort_incomplete_multipart_uploads(args.bucket, f"{args.vehicle}/{args.group}/{ecu}/{rec.name}/",
                                                         args.s3_endpoint_url, env)
                 results.append((rec.name, False, 0, local_count))
                 continue
@@ -528,16 +534,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if any(report.values()):
-        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.group}"
+        group_ufs_path = f"{args.alluxio_ufs_root}/{args.bucket}/{args.vehicle}/{args.group}"
         print(f"\nFixing up {args.group} on {args.alluxio_worker_container} ...")
         docker_exec(args.alluxio_worker_container, "mkdir", "-p",
-                    f"{group_ufs_path}/t4dataset", f"{group_ufs_path}/gps-route")
+                    f"{group_ufs_path}/gps-route")
         if not fix_permissions(args.alluxio_worker_container, group_ufs_path):
             print("  [warn] permission fix did not fully verify after retries - "
                   "some files may still be unreadable by other users", file=sys.stderr)
 
         if args.transfer_mode == "nfs":
-            alluxio_path = f"/{args.bucket}/{args.group}"
+            alluxio_path = f"/{args.bucket}/{args.vehicle}/{args.group}"
             print(f"  syncing Alluxio metadata for {alluxio_path} ...")
             if not alluxio_load_metadata(args.alluxio_worker_container, alluxio_path):
                 print(f"  [warn] Alluxio metadata sync failed for {alluxio_path} - this group "

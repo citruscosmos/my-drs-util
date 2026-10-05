@@ -19,7 +19,7 @@
 # --exclude-date (repeatable) skips recording folders whose name contains that date.
 #
 # <group_path> is the jt10 group directory itself, e.g.
-#   /mnt/DataPool/SharedData/jt10/20260916_jt10_example
+#   /mnt/DataPool/SharedData/raw/jt10/20260916_jt10_example
 # (must contain an ecu0/ subfolder; gps-route/ is created alongside it).
 set -uo pipefail
 
@@ -27,7 +27,7 @@ IMAGE="data-converter-ros2-dev:latest"
 S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:39999/api/v1/s3}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-root}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-unused-not-verified}"
-S3_BUCKET="${S3_BUCKET:-jt10}"
+S3_BUCKET="${S3_BUCKET:-raw}"
 
 if [ $# -lt 1 ]; then
   echo "usage: $0 <group_path> [-- <plot_gps_route.py extra args>]" >&2
@@ -51,6 +51,8 @@ if [ "${1:-}" = "--" ]; then
 fi
 
 GROUP_NAME="$(basename "$GROUP_PATH")"
+VEHICLE="$(basename "$(dirname "$GROUP_PATH")")"   # raw/<vehicle>/<group>
+S3_PREFIX="$VEHICLE/$GROUP_NAME"
 ECU0_DIR="${ECU0_SRC:-$GROUP_PATH/ecu0}"
 DEST_DIR="$GROUP_PATH/gps-route"
 # Derived from this script's own location (tools/drs-ingest/<this file>), not
@@ -167,10 +169,10 @@ for _ in 1 2 3 4 5; do
   # nested path alone can return empty even though the files are already on
   # disk (confirmed directly: listing gps-route/ before ever listing the
   # group root returned nothing, listing the group root first fixed it).
-  timeout 30s aws --endpoint-url "$S3_ENDPOINT" s3 ls "s3://$S3_BUCKET/$GROUP_NAME/" \
+  timeout 30s aws --endpoint-url "$S3_ENDPOINT" s3 ls "s3://$S3_BUCKET/$S3_PREFIX/" \
     --region us-east-1 >/dev/null 2>&1
   N_REMOTE="$(timeout 30s aws --endpoint-url "$S3_ENDPOINT" s3 ls --recursive \
-    "s3://$S3_BUCKET/$GROUP_NAME/gps-route/" --region us-east-1 2>/dev/null | wc -l)"
+    "s3://$S3_BUCKET/$S3_PREFIX/gps-route/" --region us-east-1 2>/dev/null | wc -l)"
   [ "$N_REMOTE" -ge "$N_LOCAL" ] && break
   sleep 3
 done

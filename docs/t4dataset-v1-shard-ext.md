@@ -73,6 +73,14 @@ T4(NuScenes 形式)データセットを、tar シャードと parquet index で
   2. 1 になければ、`<corpus ルート>/<segment_id>_<layer>[_<version>].tar`(`segment_id` が `_<数字>` で終わらないレガシー tar は、ルート直下にある)。
 - 迷う場合は、index の `tar_file` を正とする。`tar_file` は corpus ルートからの相対パス。
 
+### 2.4 corpus 名と置き場所
+
+- 生データ(録画)から作る corpus の名前は、録画グループ名 `<日付>_<車両>_<場所>` とする。
+  例: `20260930_jt10_utsunomiya`(日付は `yyyymmdd`)。
+  - 名前に**車両名を含める**。車両が違っても名前が衝突しないようにするため。
+- 置き場所は `datasets/<corpus>/`。この `<corpus>/` が corpus ルートになる。
+- 生データ(`ecu0`、`ecu1`)と、そこから作る `gps-route/` は、corpus ルートの外(`raw/<車両>/<group>/`)に置く。
+
 ## 3. 必須の層(規定)
 
 segment は `data` と `annotation` の 2 つの tar を必ず持つ。
@@ -160,6 +168,9 @@ segment は `data` と `annotation` の 2 つの tar を必ず持つ。
 }
 ```
 
+- `format` は、`t4dataset-v1-shard-ext`(本書)か、`t4dataset-v1`(展開済み形式、§9)。
+- `source`(任意)は、生データへの対応。例: `{"vehicle": "jt10", "group": "20260930_jt10_utsunomiya"}`。
+  生データのない corpus(fastlabel など)では書かなくてよい。
 - `tars` は、存在する tar の一覧。**ないことの宣言は含めない**(§4)。
 - `sha256` は任意。
 - `legacy` は、§2.2 のレガシー tar の相対パス一覧。なければ空配列。`tars` にも同じものを載せる。
@@ -177,11 +188,15 @@ corpus を公開する前に、次を検査する。
 
 ## 8. 現状との差
 
-2026-10-05: `fastlabel_data_2410` と `Kognic-2D-Annotation-adapted` は、本書の配置・index・manifest へ移行済み。
-以下の表は、移行前の差と、今も残っている項目(t4 版、空の tar、旧 `_offset_index/`)を示す。
+2026-10-05: `fastlabel_data_2410`、`Kognic-2D-Annotation-adapted`、および `jt10` の 13 グループの T4 データセット
+(`datasets/<group>/`)は、本書の配置・manifest へ移行済み。tar 形式の 2 グループ(`20260930_jt10_utsunomiya`、
+`20260910_jt10_todenarakawa_verify`)は index も本書の形に変換済みで、展開済みの 11 グループは `t4dataset-v1`(§9)として移動のみ。
+パイプライン(`rosbag-data-pipeline`)の出力も、この配置・index・manifest になった。
+以下の表は、移行前の差と、今も残っている項目(空の tar、旧 t4 版の記述)を示す。
 
 | 項目 | 現状 | 本書 |
 |---|---|---|
+| t4 版の置き場所 | `jt10/<group>/t4dataset/` | `datasets/<group>/`(§2.4) |
 | t4 版のパス | `<session>/<segment_id>/` の下に 3 ファイル | segment フォルダなし |
 | t4 版の index 列 | `category`、`member`、`tar_file`(ファイル名のみ)、`offset`、`size` | §5.1 の列 |
 | t4 版の corpus index | なし | `_index/part-*.parquet` |
@@ -190,6 +205,25 @@ corpus を公開する前に、次を検査する。
 | fastlabel 版のゼロ埋め | `segment_id` の連番がゼロ埋めの tar が 1,767 セグメント(46 session) | レガシーとして残す(§2.2)。`<session>/` へ移し、`legacy` に載せる |
 | Kognic-2D-Annotation-adapted | 絶対パスのシンボリックリンク 744 個(元 corpus `Kognic-2D-Annotation` を指す)と、実体 296 個。index なし | リンクを実体のコピーに置き換えて自己完結させる。`<session>/` へ移し、index と manifest を作る |
 | fastlabel 版の既存名 | 命名規則(§2.1)の正規表現で、`.tar` 49,529 個中 86 個が解析できない: `SemiAnnotation_*_<時刻>_<時刻>_<層>.tar` 50 個(segment_id に `_<数字>` がない)、`models_*`、`tfl_*`、`rain_*` などグループ名のみの tar 36 個 | レガシーとして残す(§2.2)。改名しない |
+
+## 9. 展開済み形式 `t4dataset-v1`
+
+tar にしていない既存の T4 データセットは、変換せずに、次の形式として扱う。
+
+```
+<corpus>/
+  _manifest.json
+  <session>/<segment_id>/
+    annotation/<テーブル>.json      # §3.2 と同じ(必須の 13 個 + 任意)
+    data/<センサチャンネル>/<フレーム番号>.<拡張子>     # §3.1 と同じ
+```
+
+- `_manifest.json` は、`format` を `t4dataset-v1` とする。`tars`、`legacy`、`_index/` は持たない。
+  `corpus`、`updated`、`sessions`、`segments`、任意の `source` を書く。
+- 配置は規定の `<session>/` の下を踏襲する(segment は、segment_id のフォルダ 1 つ)。
+- メンバー名(`annotation/` と `data/` の下の相対パス)は、tar 形式のメンバー名と同じ。
+  後から `t4dataset-v1-shard-ext` へ変換できる。
+- 規定の検査項目のうち、tar と index に関するもの(§7 の 2・3・4)は対象外。
 
 ## 付録 A. 調査結果(2026-10-05)
 

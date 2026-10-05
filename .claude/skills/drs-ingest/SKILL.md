@@ -9,7 +9,7 @@ Chains three stages for one new jt10 recording group, triggered manually
 after an operator physically plugs in both USB SSDs:
 
 1. **Detect + upload** raw `ecu0`/`ecu1` data from the two USB SSDs to
-   `jt10/<group>/{ecu0,ecu1}` via Alluxio's S3 API, with persistence
+   `raw/jt10/<group>/{ecu0,ecu1}` via Alluxio's S3 API, with persistence
    verification and a permission fix — `tools/drs-ingest/detect_and_upload.py`.
 2. **GPS route generation** from the uploaded `ecu0` data — an ephemeral ROS2
    container running `tools/gps-route`, wrapped by
@@ -20,12 +20,19 @@ after an operator physically plugs in both USB SSDs:
 Design notes (verified 2026-09-16, see this session's history for the raw
 investigation if anything below needs re-deriving):
 
-- `jt10` **is** reachable via Alluxio's S3 API (`s3://jt10/...`) even though
-  it does not appear in a plain `aws s3 ls` bucket listing (a display/cache
-  quirk of this deployment, not a real gap — addressing `s3://jt10/...`
-  directly works for both reads and writes). The worker container
+- **NAS layout (2026-10-05):** raw data lives in `raw/<vehicle>/<group>/`
+  (`/mnt/DataPool/SharedData/raw/jt10/<group>/{ecu0,ecu1,gps-route}`); the converted
+  datasets live in `datasets/<group>/` (see `docs/t4dataset-v1-shard-ext.md`). The old
+  top-level vehicle dirs (`jt10/`, `id1/`, ...) no longer exist.
+- The raw data is reachable via Alluxio's S3 API as bucket `raw`
+  (`s3://raw/jt10/<group>/...`; the bucket is the top-level NAS dir). It may not
+  appear in a plain `aws s3 ls` bucket listing — addressing `s3://raw/...`
+  directly works. Note: with no Alluxio *worker* registered (observed 2026-10-05:
+  `alluxio fsadmin report capacity` says "No workers found"), S3 reads of metadata and
+  listings work but S3 uploads fail with "No available Alluxio worker found" —
+  use `--transfer-mode nfs`. The worker container
   `petadata-alluxio-worker-warm-1` bind-mounts the host's
-  `/mnt/DataPool/SharedData` (jt10's NFS export) at
+  `/mnt/DataPool/SharedData` (the NAS's NFS export) at
   `/opt/alluxio/underFSStorage` — S3 writes and direct-NFS writes land on
   the exact same files, just via two access paths.
 - S3-written objects come back `root:root` / `rwxrwx---` (no "other"
@@ -36,7 +43,7 @@ investigation if anything below needs re-deriving):
   group directory is `drwxrwxrwx`, and Stage 2's ephemeral (unprivileged)
   container must be able to create new files under `gps-route/` without any
   further root trick. `detect_and_upload.py` also pre-creates `gps-route/`
-  and `t4dataset/` (empty) at this step, both with this open permission, so
+  (empty) at this step, with this open permission, so
   downstream stages never need to write into the (deliberately left
   more-restrictive) `ecu0/`/`ecu1/` raw-data tree at all — confirmed
   directly: `batch_plot_gps_route.py`'s default "write output alongside the
@@ -115,7 +122,7 @@ Reading the multi-GB MCAPs back from the NAS over NFS is what made Stage 2/3 slo
 The ingest flow therefore never reads raw data from the NAS: everything is read from the source SSDs
 (USB 3, ~1GB/s) or from a local copy, and the raw data is uploaded to the NAS in the background.
 
-1. **Prepare** — detect the SSDs, check link speed, create `<group>/{ecu0,ecu1,t4dataset,gps-route}`
+1. **Prepare** — detect the SSDs, check link speed, create `<group>/{ecu0,ecu1,gps-route}`
    on the NAS (root-owned parents need `docker exec`, done by the script):
    ```bash
    python3 tools/drs-ingest/detect_and_upload.py --group <group> --prepare-only
@@ -139,7 +146,10 @@ The ingest flow therefore never reads raw data from the NAS: everything is read 
    Per chunk (default 10 ECU0 files, 2 chunks in parallel, 600GB local budget): copy from the SSD to the
    local workspace -> merge/decode/convert from the local copy while the chunk's raw files upload to
    `<group>/{ecu0,ecu1}/` in the background -> (after the raw upload is size-verified) copy the converted
-   segments to `t4dataset/`. The log says whether each chunk's raw upload was hidden behind processing.
+   segments to the corpus `datasets/<group>/` (next to the vehicle dirs; `--datasets-root` overrides). The log says
+   whether each chunk's raw upload was hidden behind processing. The tar shards go straight into
+   `datasets/<group>/<session>/`; at the end the corpus index `_index/` and `_manifest.json` are written
+   (format `t4dataset-v1-shard-ext`, see `docs/t4dataset-v1-shard-ext.md`).
    Failure/exit semantics are those of Step 3 (lock file, `Batch run complete: processed=X failed=Y`).
    `--output-format tar` is recommended: the converted segment copy of ~3800 small files per segment is
    otherwise the slow step; consumers of the dataset must read the tar shards.
@@ -187,12 +197,13 @@ insertion). If a port isn't mounted, ask the operator to check the cable/
 insertion before proceeding — don't guess at partial data.
 
 Ask the operator for the recording date and a place/keyword, and form the
-group name following the existing convention (`<date>_jt10_<place>`, e.g.
-`20260916_jt10_example`). Confirm it doesn't already exist:
+group name following the existing convention (`<date>_<vehicle>_<place>`, e.g.
+`20260916_jt10_example`; the vehicle name stays in the name so corpus names never collide). Confirm it doesn't already exist:
 
 ```bash
-aws --endpoint-url http://127.0.0.1:39999/api/v1/s3 s3 ls s3://jt10/ --region us-east-1 \
-  --no-sign-request 2>/dev/null | grep <group> || echo "new group, OK to proceed"
+AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x \
+aws --endpoint-url http://127.0.0.1:39999/api/v1/s3 s3 ls s3://raw/jt10/ --region us-east-1 \
+  2>/dev/null | grep <group> || echo "new group, OK to proceed"
 ```
 
 (If it *does* exist, this is a resume — `detect_and_upload.py` skips
@@ -237,7 +248,7 @@ and monitoring the log rather than blocking, same as the batch steps below.
 ## Step 2 — GPS route generation (legacy flow reads the NAS; the ingest flow reads the SSD)
 
 ```bash
-tools/drs-ingest/run_gps_route_ephemeral.sh /mnt/DataPool/SharedData/jt10/<group>
+tools/drs-ingest/run_gps_route_ephemeral.sh /mnt/DataPool/SharedData/raw/jt10/<group>
 ```
 
 This spins up its own ephemeral ROS2 container (installs `mcap`/
@@ -283,7 +294,7 @@ its path rather than guessing further.
 ```bash
 cd "$ROSBAG_PIPELINE_REPO"
 nohup python3 python/run_batch_t4_pipeline.py \
-  /mnt/DataPool/SharedData/jt10/<group> \
+  /mnt/DataPool/SharedData/raw/jt10/<group> \
   --convert-config config/convert_rosbag2_to_non_annotated_t4_fisheye_delay.yaml \
   --duration 30 --process-mode balanced --merge-mode smart --min-overlap-sec 5 \
   --driver auto --max-parallel 4 --docker-container rosbag-pipeline-dev \
@@ -292,7 +303,7 @@ disown
 ```
 
 `root_dir` is pointed **directly at the new group's own path**, not its
-`jt10/` parent — `find_group_dirs()` starts scanning at `root_dir` itself,
+`raw/jt10/` parent — `find_group_dirs()` starts scanning at `root_dir` itself,
 so this scopes the run to exactly this one group instead of rescanning all
 existing jt10 groups (confirmed against the script's source,
 `run_batch_t4_pipeline.py:77-96`). `--min-overlap-sec 5` must be passed
