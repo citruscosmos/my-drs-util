@@ -55,12 +55,23 @@ T4(NuScenes 形式)データセットを、tar シャードと parquet index で
 
 ### 2.2 レガシーの tar
 
-- 命名規則(§2.1)に合わない既存の tar は、**改名せずレガシーとして残す**。
+- 命名規則(§2.1)に合わない既存の tar は、**改名せずレガシーとして残す**。対象は次の 2 種類。
+  - segment の連番がゼロ埋めされている tar(例: `..._071_data.tar`)。
+  - `segment_id` が `_<数字>` で終わらない tar(例: `SemiAnnotation_*`、`models_annotation.tar` のようなグループ名のみの tar)。
 - レガシー tar は、次のように扱う。
   - `_manifest.json` の `legacy` に、corpus ルートからの相対パスで列挙する(§6)。
-  - 命名規則(§2.1)と、検査項目 1・2・6(§7)の対象外とする。
+  - 命名規則(§2.1)と、検査項目 1・2・6(§7)の対象外とする。名前は変えないので、index の `segment_id` も、レガシーの名前から読み取ったままとする(`_071` のまま)。
+  - 置き場所は §2 に従う。`segment_id` から session が決まるもの(ゼロ埋めの tar)は `<session>/` の下へ置く。
+    session が決まらないもの(グループ名のみの tar など)は、corpus ルート直下に残す。
   - 新しく作る tar は、レガシーの名前に合わせず、必ず §2.1 に従う。
 - レガシーかどうかの判定は、`legacy` への記載だけで行う(名前の形では判定しない)。
+
+### 2.3 tar の場所の解決
+
+- 利用側は、`segment_id` と層から、tar の場所を次の順で探す。
+  1. `<corpus ルート>/<session>/<segment_id>_<layer>[_<version>].tar`。`session` は、`segment_id` の末尾の `_<数字>` を取り除いた部分。
+  2. 1 になければ、`<corpus ルート>/<segment_id>_<layer>[_<version>].tar`(`segment_id` が `_<数字>` で終わらないレガシー tar は、ルート直下にある)。
+- 迷う場合は、index の `tar_file` を正とする。`tar_file` は corpus ルートからの相対パス。
 
 ## 3. 必須の層(規定)
 
@@ -75,10 +86,14 @@ segment は `data` と `annotation` の 2 つの tar を必ず持つ。
 
 ### 3.2 `<segment_id>_annotation.tar`
 
-- メンバーは T4 の JSON テーブルをそのまま、ディレクトリなしの平置きで入れる。
+- メンバーは JSON テーブルをそのまま、ディレクトリなしの平置きで入れる。
+- 必須のメンバーは、T4 の次の 13 個。
   `attribute.json`、`calibrated_sensor.json`、`category.json`、`ego_pose.json`、`instance.json`、`log.json`、
   `map.json`、`sample.json`、`sample_annotation.json`、`sample_data.json`、`scene.json`、`sensor.json`、
-  `vehicle_status.json`、`visibility.json`。
+  `visibility.json`。
+- `vehicle_status.json` は任意とする(fastlabel_data_2410 の annotation tar 9,889 個のうち 8,683 個に存在しないため)。
+- 必須以外の JSON テーブルを追加してよい。追加するメンバーの内容は規定しない
+  (既存の例: `vehicle_status.json`、`object_ann.json`、`surface_ann.json`、`autolabel_model.json`)。
 - 内容の整合(prev/next リンク、トークンの一意性)は、tar にする前に検証する。
 
 ## 4. 追加 tar(非規定)
@@ -160,7 +175,10 @@ corpus を公開する前に、次を検査する。
 5. `annotation` の JSON が有効で、トークンが重複せず、sample_data の prev/next が整合する。
 6. 空の tar、命名規則に反するファイルがない(レガシーを除く)。
 
-## 8. 現状との差(未対応)
+## 8. 現状との差
+
+2026-10-05: `fastlabel_data_2410` と `Kognic-2D-Annotation-adapted` は、本書の配置・index・manifest へ移行済み。
+以下の表は、移行前の差と、今も残っている項目(t4 版、空の tar、旧 `_offset_index/`)を示す。
 
 | 項目 | 現状 | 本書 |
 |---|---|---|
@@ -169,6 +187,8 @@ corpus を公開する前に、次を検査する。
 | t4 版の corpus index | なし | `_index/part-*.parquet` |
 | t4 版の manifest | `.chunked_complete`(録画ごと) | `_manifest.json` |
 | fastlabel 版 | フラット(49,529 tar)、絶対パス、`tlr_conditions` が index にない、空 tar あり | §2〜§7 |
+| fastlabel 版のゼロ埋め | `segment_id` の連番がゼロ埋めの tar が 1,767 セグメント(46 session) | レガシーとして残す(§2.2)。`<session>/` へ移し、`legacy` に載せる |
+| Kognic-2D-Annotation-adapted | 絶対パスのシンボリックリンク 744 個(元 corpus `Kognic-2D-Annotation` を指す)と、実体 296 個。index なし | リンクを実体のコピーに置き換えて自己完結させる。`<session>/` へ移し、index と manifest を作る |
 | fastlabel 版の既存名 | 命名規則(§2.1)の正規表現で、`.tar` 49,529 個中 86 個が解析できない: `SemiAnnotation_*_<時刻>_<時刻>_<層>.tar` 50 個(segment_id に `_<数字>` がない)、`models_*`、`tfl_*`、`rain_*` などグループ名のみの tar 36 個 | レガシーとして残す(§2.2)。改名しない |
 
 ## 付録 A. 調査結果(2026-10-05)
