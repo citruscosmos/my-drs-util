@@ -104,6 +104,23 @@ segment は `data` と `annotation` の 2 つの tar を必ず持つ。
   (既存の例: `vehicle_status.json`、`object_ann.json`、`surface_ann.json`、`autolabel_model.json`)。
 - 内容の整合(prev/next リンク、トークンの一意性)は、tar にする前に検証する。
 
+### 3.3 annotation の版
+
+annotation の内容を直したとき(値の修正、桁数の修正など)は、古い版を残したまま新しい版を追加できる。
+
+- 版付きの tar は `<segment_id>_annotation_<version>.tar`(例: `..._0_annotation_v0.1.0.tar`)。メンバーは §3.2 と同じ。
+- 無版の `<segment_id>_annotation.tar` は**既定版**で、常に最新の版と**同一の内容**を持つ(実ファイルのコピー。
+  シンボリックリンクやハードリンクにしない。S3/Alluxio 経由の読み出しや `rsync -a` で保たれないため)。
+  新しい版を作るときは、無版も新しい内容に更新する。
+- 無版だけの segment(版を作っていない segment)も、そのまま有効である。
+- index の `layer_version` は、無版の行が null、版付きの行がその版。`layer = annotation` だけで検索すると、
+  同じメンバーが版の数 + 1 行返る。読み出し側は、版を指定するか、`layer_version` が null の行(既定版)だけを使う。
+- manifest の `tars` と index には、版付きも無版も載せる(§7 の検査 2)。
+- 既定版と最新の版が同一であること(sha256 が一致)は、検査項目に含める。
+
+例: `20261007_jt10_tonai_shoutengai` は、`ego_pose.json` / `calibrated_sensor.json` の数値が 6 桁に丸まっていたため
+(旧版 `v0.1.0`)、全桁に直した `v0.1.1` を追加した。無版は `v0.1.1` と同じ。
+
 ## 4. 追加 tar(非規定)
 
 - 追加 tar(例: `panoptic-segmentation`、`traffic-light-recognition`、`tlr_conditions_v0.1.0`)は、
@@ -185,6 +202,7 @@ corpus を公開する前に、次を検査する。
 4. 無作為抽出した行で、`offset_data` から読んだ先頭バイトが拡張子と一致する(JPEG の `FFD8`、JSON の先頭文字など)。
 5. `annotation` の JSON が有効で、トークンが重複せず、sample_data の prev/next が整合する。
 6. 空の tar、命名規則に反するファイルがない(レガシーを除く)。
+7. 版付きの annotation がある segment では、無版の `annotation.tar` が最新の版と同一内容である(§3.3)。
 
 ## 8. 現状との差
 
